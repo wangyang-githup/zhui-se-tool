@@ -25,6 +25,7 @@ a = Analysis(
         'scipy',
         'scipy.ndimage',
         'scipy.special',
+        'customtkinter',
         'color_engine',
     ],
     hookspath=[],

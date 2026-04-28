@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>追色工具 · Web 版</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:      #1e1e2e;
+    --card:    #2a2a3e;
+    --border:  #313244;
+    --text:    #cdd6f4;
+    --muted:   #6c7086;
+    --accent:  #cba6f7;
+    --green:   #a6e3a1;
+    --red:     #f38ba8;
+    --blue:    #89b4fa;
+    --yellow:  #f9e2af;
+  }
+  body { background: var(--bg); color: var(--text); font-family: "PingFang SC", "Helvetica Neue", sans-serif; min-height: 100vh; }
+  header { padding: 20px 32px; border-bottom: 1px solid var(--border); display: flex; align-items: baseline; gap: 16px; }
+  header h1 { font-size: 22px; color: var(--accent); }
+  header p  { font-size: 12px; color: var(--muted); }
+  .main { display: grid; grid-template-columns: 1fr 280px; gap: 0; height: calc(100vh - 65px); }
+
+  /* 预览区 */
+  .preview-area { padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; overflow: auto; }
+  .panels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; flex: 1; }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; }
+  .panel-title { padding: 8px 12px; font-size: 11px; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--border); }
+  .panel-img { flex: 1; display: flex; align-items: center; justify-content: center; cursor: pointer; min-height: 220px; position: relative; }
+  .panel-img img { max-width: 100%; max-height: 280px; object-fit: contain; display: block; }
+  .panel-img .placeholder { color: var(--muted); font-size: 13px; text-align: center; padding: 20px; }
+  .panel-img:hover .placeholder { color: var(--accent); }
+
+  /* 指标栏 */
+  .metrics-bar { background: var(--card); border-radius: 8px; padding: 10px 16px; font-size: 12px; color: var(--muted); }
+  .metrics-bar span { color: var(--text); font-weight: 600; }
+  .metrics-bar .safe   { color: var(--green); }
+  .metrics-bar .unsafe { color: var(--red); }
+
+  /* 右侧控制栏 */
+  .control-panel { background: var(--card); border-left: 1px solid var(--border); padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+  .section-title { font-size: 11px; font-weight: 700; color: var(--accent); letter-spacing: .5px; margin: 12px 0 6px; }
+  .slider-row { margin: 5px 0; }
+  .slider-label { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 3px; }
+  .slider-label .name { color: var(--text); }
+  .slider-label .val  { color: var(--accent); font-weight: 700; width: 40px; text-align: right; }
+  input[type=range] { width: 100%; accent-color: var(--accent); height: 4px; cursor: pointer; }
+
+  /* 按钮 */
+  .btn { display: block; width: 100%; padding: 10px; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity .15s; }
+  .btn:hover { opacity: .85; }
+  .btn-primary { background: var(--accent); color: #1e1e2e; }
+  .btn-secondary { background: var(--border); color: var(--text); margin-top: 6px; }
+
+  /* Loading */
+  .loading { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); align-items: center; justify-content: center; z-index: 999; font-size: 16px; color: var(--accent); flex-direction: column; gap: 10px; }
+  .loading.show { display: flex; }
+  .spinner { width: 36px; height: 36px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Reason tooltip */
+  .reason-box { background: #181825; border-radius: 6px; padding: 8px 12px; font-size: 11px; color: var(--muted); line-height: 1.6; margin-top: 4px; display: none; }
+  .reason-box.show { display: block; }
+  .toggle-reason { font-size: 11px; color: var(--blue); cursor: pointer; background: none; border: none; padding: 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>✦ 追色工具 · Web MVP</h1>
+  <p>上传参考图和原图 → 自动分析 → 实时微调</p>
+</header>
+
+<div class="main">
+  <!-- 预览区 -->
+  <div class="preview-area">
+    <div class="panels">
+      <!-- 参考图 -->
+      <div class="panel">
+        <div class="panel-title">参考图  Reference</div>
+        <div class="panel-img" id="refDrop" onclick="document.getElementById('refInput').click()">
+          <div class="placeholder" id="refPlaceholder">点击上传参考图</div>
+          <img id="refPreview" style="display:none">
+        </div>
+        <input type="file" id="refInput" accept="image/*" style="display:none" onchange="handleUpload('ref',this)">
+      </div>
+      <!-- 原图 -->
+      <div class="panel">
+        <div class="panel-title">原图  Source</div>
+        <div class="panel-img" id="srcDrop" onclick="document.getElementById('srcInput').click()">
+          <div class="placeholder" id="srcPlaceholder">点击上传原图</div>
+          <img id="srcPreview" style="display:none">
+        </div>
+        <input type="file" id="srcInput" accept="image/*" style="display:none" onchange="handleUpload('src',this)">
+      </div>
+      <!-- 结果图 -->
+      <div class="panel">
+        <div class="panel-title">追色结果  Result</div>
+        <div class="panel-img">
+          <div class="placeholder" id="resultPlaceholder">追色结果将显示在这里</div>
+          <img id="resultPreview" style="display:none">
+        </div>
+      </div>
+    </div>
+
+    <!-- 评价指标栏 -->
+    <div class="metrics-bar" id="metricsBar">
+      等待追色… 上传两张图后点击「开始追色」
+    </div>
+  </div>
+
+  <!-- 右侧参数面板 -->
+  <div class="control-panel">
+    <div style="font-size:13px;font-weight:700;color:var(--accent)">⚙ 追色参数</div>
+
+    <div class="section-title">全局强度</div>
+    <div class="slider-row">
+      <div class="slider-label"><span class="name">强度 Strength</span><span class="val" id="val_strength">100%</span></div>
+      <input type="range" id="sl_strength" min="0" max="100" value="100" oninput="updateVal('strength',this.value,'%')">
+    </div>
+
+    <div class="section-title">基础面板</div>
+    <div id="toneSliders"></div>
+
+    <div class="section-title">调整理由</div>
+    <button class="toggle-reason" onclick="toggleReason()">▶ 展开说明</button>
+    <div class="reason-box" id="reasonBox"></div>
+
+    <div style="margin-top:auto;padding-top:16px;">
+      <button class="btn btn-primary" onclick="startAnalyze()">▶  开始追色</button>
+      <button class="btn btn-secondary" onclick="applyManual()">↻  应用微调</button>
+      <button class="btn btn-secondary" onclick="downloadResult()">↓  下载结果图</button>
+    </div>
+  </div>
+</div>
+
+<!-- Loading -->
+<div class="loading" id="loading">
+  <div class="spinner"></div>
+  <div id="loadingText">分析中…</div>
+</div>
+
+<script>
+// ── 状态 ──
+const state = {
+  refFile: null,
+  srcFile: null,
+  params: null,
+  resultB64: null,
+};
+
+const TONE_FIELDS = [
+  { key: "exposure",   label: "曝光 EV",   min: -500, max: 500, unit: "",  scale: 100 },
+  { key: "contrast",   label: "对比度",     min: -100, max: 100, unit: "",  scale: 1   },
+  { key: "highlights", label: "高光",       min: -100, max: 100, unit: "",  scale: 1   },
+  { key: "shadows",    label: "阴影",       min: -100, max: 100, unit: "",  scale: 1   },
+  { key: "whites",     label: "白色",       min: -100, max: 100, unit: "",  scale: 1   },
+  { key: "blacks",     label: "黑色",       min: -100, max: 100, unit: "",  scale: 1   },
+];
+
+// ── 上传处理 ──
+function handleUpload(type, input) {
+  const file = input.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  if (type === "ref") {
+    state.refFile = file;
+    document.getElementById("refPreview").src = url;
+    document.getElementById("refPreview").style.display = "block";
+    document.getElementById("refPlaceholder").style.display = "none";
+  } else {
+    state.srcFile = file;
+    document.getElementById("srcPreview").src = url;
+    document.getElementById("srcPreview").style.display = "block";
+    document.getElementById("srcPlaceholder").style.display = "none";
+  }
+}
+
+// ── 分析并追色 ──
+async function startAnalyze() {
+  if (!state.refFile || !state.srcFile) {
+    alert("请先上传参考图和原图");
+    return;
+  }
+  showLoading("分析色彩特征中…");
+  const fd = new FormData();
+  fd.append("ref_image", state.refFile);
+  fd.append("src_image", state.srcFile);
+  fd.append("strength", document.getElementById("sl_strength").value / 100);
+
+  try {
+    const res = await fetch("/api/analyze", { method: "POST", body: fd });
+    const data = await res.json();
+    if (data.error) { alert("错误：" + data.error); return; }
+
+    state.params   = data.params;
+    state.resultB64 = data.preview_b64;
+
+    // 显示结果图
+    showResult(data.preview_b64);
+    // 渲染滑块
+    renderSliders(data.params.tone);
+    // 显示评价指标
+    showMetrics(data.metrics);
+    // 显示理由
+    fillReasons(data.params);
+  } catch(e) {
+    alert("请求失败：" + e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+// ── 手动微调后重新渲染 ──
+async function applyManual() {
+  if (!state.refFile || !state.srcFile) return;
+  showLoading("渲染中…");
+
+  // 从滑块读取当前值，更新 params
+  const toneOverride = {};
+  TONE_FIELDS.forEach(f => {
+    const el = document.getElementById("sl_" + f.key);
+    if (el) toneOverride[f.key] = parseFloat(el.value) / f.scale;
+  });
+  const paramsToSend = Object.assign({}, state.params || {});
+  if (paramsToSend.tone) Object.assign(paramsToSend.tone, toneOverride);
+
+  const fd = new FormData();
+  fd.append("ref_image",   state.refFile);
+  fd.append("src_image",   state.srcFile);
+  fd.append("params_json", JSON.stringify(paramsToSend));
+  fd.append("strength",    document.getElementById("sl_strength").value / 100);
+
+  try {
+    const res = await fetch("/api/render", { method: "POST", body: fd });
+    const data = await res.json();
+    if (data.error) { alert("错误：" + data.error); return; }
+    state.resultB64 = data.preview_b64;
+    showResult(data.preview_b64);
+    showMetrics(data.metrics);
+  } finally {
+    hideLoading();
+  }
+}
+
+// ── 渲染滑块 ──
+function renderSliders(tone) {
+  const container = document.getElementById("toneSliders");
+  container.innerHTML = "";
+  TONE_FIELDS.forEach(f => {
+    const val = tone[f.key] ?? 0;
+    const displayVal = Math.round(val * f.scale);
+    container.innerHTML += `
+      <div class="slider-row">
+        <div class="slider-label">
+          <span class="name">${f.label}</span>
+          <span class="val" id="val_${f.key}">${displayVal}${f.unit}</span>
+        </div>
+        <input type="range" id="sl_${f.key}" min="${f.min}" max="${f.max}" value="${displayVal}"
+          oninput="updateVal('${f.key}', this.value, '${f.unit}')">
+      </div>`;
+  });
+}
+
+function updateVal(key, val, unit) {
+  const el = document.getElementById("val_" + key);
+  if (el) el.textContent = val + unit;
+}
+
+// ── 评价指标 ──
+function showMetrics(m) {
+  if (!m) return;
+  const safe = m.skin_delta_e?.safe;
+  const skinText = safe === false
+    ? `<span class="unsafe">✗ 肤色偏移 ΔE=${m.skin_delta_e.mean_de}</span>`
+    : `<span class="safe">✓ 肤色安全</span>`;
+  document.getElementById("metricsBar").innerHTML =
+    `影调相似度 <span>${(m.histogram_similarity*100).toFixed(1)}%</span>　·　`+
+    `Lab偏差 ΔE <span>${m.lab_match?.overall_de??'-'}</span>（${m.lab_match?.grade??''}）　·　`+
+    skinText;
+}
+
+// ── 理由 ──
+function fillReasons(params) {
+  const box = document.getElementById("reasonBox");
+  const lines = [];
+  if (params.reasons?.tone)        lines.push("📐 影调：" + params.reasons.tone);
+  if (params.reasons?.curve)       lines.push("🎚 曲线：" + params.reasons.curve);
+  if (params.reasons?.hsl)         lines.push("🎨 HSL：" + params.reasons.hsl);
+  if (params.reasons?.split_tone)  lines.push("🌅 分离色调：" + params.reasons.split_tone);
+  if (params.reasons?.calibration) lines.push("🌡 校准：" + params.reasons.calibration);
+  box.innerHTML = lines.join("<br><br>");
+}
+
+function toggleReason() {
+  const box = document.getElementById("reasonBox");
+  const btn = document.querySelector(".toggle-reason");
+  box.classList.toggle("show");
+  btn.textContent = box.classList.contains("show") ? "▼ 收起说明" : "▶ 展开说明";
+}
+
+// ── 结果图显示 ──
+function showResult(b64) {
+  const img = document.getElementById("resultPreview");
+  img.src = "data:image/jpeg;base64," + b64;
+  img.style.display = "block";
+  document.getElementById("resultPlaceholder").style.display = "none";
+}
+
+// ── 下载 ──
+function downloadResult() {
+  if (!state.resultB64) { alert("请先执行追色"); return; }
+  const a = document.createElement("a");
+  a.href = "data:image/jpeg;base64," + state.resultB64;
+  a.download = "追色结果_" + Date.now() + ".jpg";
+  a.click();
+}
+
+// ── Loading ──
+function showLoading(text) {
+  document.getElementById("loadingText").textContent = text || "处理中…";
+  document.getElementById("loading").classList.add("show");
+}
+function hideLoading() {
+  document.getElementById("loading").classList.remove("show");
+}
+</script>
+</body>
+</html>

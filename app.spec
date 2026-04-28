@@ -19,14 +19,12 @@ a = Analysis(
         # 字体文件打包（如果有的话）
     ],
     hiddenimports=[
-        'cv2',
         'numpy',
         'PIL',
         'PIL._tkinter_finder',
         'scipy',
-        'scipy.special',
         'scipy.ndimage',
-        'threading',
+        'scipy.special',
         'color_engine',
     ],
     hookspath=[],

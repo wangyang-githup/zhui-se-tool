@@ -15,9 +15,7 @@ a = Analysis(
     [os.path.join(project_root, 'app.py')],
     pathex=[project_root],
     binaries=[],
-    datas=[
-        # 字体文件打包（如果有的话）
-    ],
+    datas=[],
     hiddenimports=[
         'numpy',
         'PIL',
@@ -25,7 +23,6 @@ a = Analysis(
         'scipy',
         'scipy.ndimage',
         'scipy.special',
-        'customtkinter',
         'color_engine',
     ],
     hookspath=[],

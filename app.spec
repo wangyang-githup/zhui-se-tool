@@ -1,33 +1,46 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 追色工具 打包配置
+# 追色工具 打包配置 (v2.0 — 无OpenCV)
 # 用法: pyinstaller app.spec
 
 import os
 import sys
-import shutil
 
 block_cipher = None
 
-# 项目根目录（spec 文件所在目录）
 project_root = os.path.dirname(os.path.abspath(SPEC))
+
+# CustomTkinter 资源文件
+import customtkinter as ctk
+ctk_assets = os.path.join(os.path.dirname(ctk.__file__), 'assets')
 
 a = Analysis(
     [os.path.join(project_root, 'app.py')],
     pathex=[project_root],
     binaries=[],
     datas=[
-        # 字体文件打包（如果有的话）
+        # CustomTkinter 资源（必须打包，否则界面灰色）
+        (ctk_assets, 'customtkinter/assets'),
     ],
     hiddenimports=[
-        'cv2',
         'numpy',
         'PIL',
         'PIL._tkinter_finder',
         'scipy',
         'scipy.special',
         'scipy.ndimage',
-        'threading',
+        'scipy.cluster',
+        'sklearn',
+        'sklearn.cluster',
+        'sklearn.utils',
+        'sklearn.utils._typedefs',
+        'sklearn.utils._heap',
+        'sklearn.utils._sorting',
+        'sklearn.utils._vector_sentinel',
+        'sklearn.neighbors',
+        'sklearn.neighbors._partition_nodes',
+        'customtkinter',
         'color_engine',
+        'threading',
     ],
     hookspath=[],
     hooksconfig={},
@@ -48,13 +61,13 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,            # 不显示终端窗口
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,               # 如有 .icns 图标可在此指定
+    icon=None,
 )
 
 coll = COLLECT(
@@ -68,23 +81,24 @@ coll = COLLECT(
     name='追色工具',
 )
 
-# ── 生成 macOS .app Bundle ──────────────────────────────────
 app = BUNDLE(
     coll,
     name='追色工具.app',
-    icon=None,                # 可在此指定 app.icns
+    icon=None,
     bundle_identifier='com.zhuisse.color-tool',
     info_plist={
         'CFBundleName': '追色工具',
         'CFBundleDisplayName': '追色工具',
         'CFBundleIdentifier': 'com.zhuisse.color-tool',
-        'CFBundleVersion': '1.0.0',
-        'CFBundleShortVersionString': '1.0.0',
+        'CFBundleVersion': '2.0.0',
+        'CFBundleShortVersionString': '2.0.0',
         'CFBundlePackageType': 'APPL',
         'CFBundleExecutable': '追色工具',
         'LSMinimumSystemVersion': '10.15',
         'NSHighResolutionCapable': True,
         'LSApplicationCategoryType': 'public.app-category.photography',
+        'NSDocumentsFolderUsageDescription': '追色工具需要访问图片文件以进行色彩迁移',
+        'NSPhotoLibraryUsageDescription': '追色工具需要访问照片以进行色彩迁移',
     },
     force=False,
 )

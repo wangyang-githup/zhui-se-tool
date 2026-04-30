@@ -18,16 +18,20 @@ GET /
 import io
 import base64
 import json
+import os
+import sys
 import numpy as np
-import cv2
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image as PILImage
 
-from feature_extractor import FeatureExtractor, load_as_rgb_float
-from grading_generator import ColorGradingGenerator
-from color_renderer import ColorRenderer
-from evaluator import evaluate_result   # 模块五
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from color_engine import (
+    ZhuiseEngine,
+    FeatureExtractor,
+    ColorGradingGenerator,
+)
 
 app = FastAPI(title="追色 API", version="1.0.0")
 
@@ -40,7 +44,7 @@ app.add_middleware(
 
 extractor = FeatureExtractor()
 generator = ColorGradingGenerator()
-renderer  = ColorRenderer()
+engine = ZhuiseEngine()
 
 
 # ─────────────────────────────────────────────────────
@@ -50,26 +54,23 @@ renderer  = ColorRenderer()
 def file_to_rgb_float(upload: UploadFile) -> np.ndarray:
     """UploadFile → float32 RGB [0,1]"""
     data = upload.file.read()
-    arr  = np.frombuffer(data, np.uint8)
-    bgr  = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise ValueError(f"无法解码图片：{upload.filename}")
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    # 限制最大分辨率（加速处理）
-    H, W = rgb.shape[:2]
+    pil = PILImage.open(io.BytesIO(data)).convert("RGB")
+    W, H = pil.size
     MAX_SIDE = 1200
     if max(H, W) > MAX_SIDE:
         scale = MAX_SIDE / max(H, W)
-        rgb = cv2.resize(rgb, (int(W*scale), int(H*scale)))
-    return rgb
+        pil = pil.resize((int(W * scale), int(H * scale)), PILImage.LANCZOS)
+    arr = np.asarray(pil, dtype=np.float32) / 255.0
+    return arr
 
 
 def rgb_float_to_jpeg_b64(img: np.ndarray, quality: int = 88) -> str:
     """float32 RGB [0,1] → base64 JPEG 字符串"""
-    u8  = (img.clip(0,1) * 255).astype(np.uint8)
-    bgr = cv2.cvtColor(u8, cv2.COLOR_RGB2BGR)
-    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    return base64.b64encode(buf.tobytes()).decode("utf-8")
+    u8 = (img.clip(0, 1) * 255).astype(np.uint8)
+    pil = PILImage.fromarray(u8, mode="RGB")
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=int(quality), optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 # ─────────────────────────────────────────────────────
@@ -105,14 +106,12 @@ async def analyze(
         ref_img = file_to_rgb_float(ref_image)
         src_img = file_to_rgb_float(src_image)
 
-        ref_feat = extractor.extract(ref_img)
+        engine.load_reference(ref_img)
+        ref_feat = engine.ref_features
         src_feat = extractor.extract(src_img)
-
         params = generator.generate(ref_feat, src_feat, strength=strength)
-
-        result = renderer.render(src_img, params, ref_feat)
-
-        metrics = evaluate_result(src_img, ref_img, result, ref_feat, src_feat)
+        result = engine.render(src_img, mode="expert", strength=strength, params=params)
+        metrics = engine.evaluate(src_img, result)
 
         return JSONResponse({
             "params":       params.to_dict(),
@@ -142,20 +141,20 @@ async def render_with_params(
     try:
         src_img = file_to_rgb_float(src_image)
         ref_img = file_to_rgb_float(ref_image)
-        ref_feat = extractor.extract(ref_img)
+        engine.load_reference(ref_img)
+        ref_feat = engine.ref_features
 
-        # 从前端回传的 JSON 重建参数（仅更新 strength 和核心数值）
         raw = json.loads(params_json)
-        params = generator.generate(ref_feat, extractor.extract(src_img), strength=strength)
-        # 覆盖前端微调的核心数值
+        src_feat = extractor.extract(src_img)
+        params = generator.generate(ref_feat, src_feat, strength=strength)
         if "tone" in raw:
             t = raw["tone"]
             for field in ["exposure","contrast","highlights","shadows","whites","blacks"]:
                 if field in t:
                     setattr(params.tone, field, float(t[field]))
 
-        result = renderer.render(src_img, params, ref_feat)
-        metrics = evaluate_result(src_img, ref_img, result, ref_feat, extractor.extract(src_img))
+        result = engine.render(src_img, mode="expert", strength=strength, params=params)
+        metrics = engine.evaluate(src_img, result)
 
         return JSONResponse({
             "preview_b64": rgb_float_to_jpeg_b64(result),

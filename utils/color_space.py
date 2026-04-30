@@ -54,7 +54,8 @@ def rgb_to_lab(img: np.ndarray) -> np.ndarray:
     linear = _srgb_to_linear(img.astype(np.float64))
     shape = linear.shape
     flat = linear.reshape(-1, 3)
-    xyz = flat @ _M_RGB2XYZ.T
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        xyz = flat @ _M_RGB2XYZ.T
     xyz = xyz.reshape(shape)
 
     xyz_n = xyz / _D65_XYZ
@@ -94,7 +95,8 @@ def lab_to_rgb(lab: np.ndarray) -> np.ndarray:
     xyz = np.stack([x, y, z], axis=-1)
     shape = xyz.shape
     flat = xyz.reshape(-1, 3)
-    linear = flat @ _M_XYZ2RGB.T
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        linear = flat @ _M_XYZ2RGB.T
     linear = linear.reshape(shape).clip(0, 1)
 
     srgb = _linear_to_srgb(linear)

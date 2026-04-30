@@ -91,6 +91,8 @@ class App(ctk.CTk):
         self._processing = False
         self._lock = threading.Lock()
         self._work_queue = queue.Queue()
+        self._auto_preview_job = None
+        self._auto_preview_delay_ms = 300
 
         # 构建UI
         self._build_ui()
@@ -507,7 +509,23 @@ class App(ctk.CTk):
 
     def _on_param_change(self):
         """参数变化回调 (可扩展为自动预览)"""
-        pass
+        if self.ref_img_np is None or self.src_img_np is None:
+            return
+        if self._auto_preview_job is not None:
+            try:
+                self.after_cancel(self._auto_preview_job)
+            except Exception:
+                self._auto_preview_job = None
+        self._auto_preview_job = self.after(self._auto_preview_delay_ms, self._auto_preview_fire)
+ 
+    def _auto_preview_fire(self):
+        self._auto_preview_job = None
+        with self._lock:
+            busy = self._processing
+        if busy:
+            self._auto_preview_job = self.after(self._auto_preview_delay_ms, self._auto_preview_fire)
+            return
+        self._run_transfer_async()
 
     def _get_mode(self):
         return "simple" if self._mode_var.get() == "简化" else "expert"

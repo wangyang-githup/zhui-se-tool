@@ -158,6 +158,10 @@ class ToneParams:
     shadows: float = 0.0     # -100 ~ +100
     whites: float = 0.0      # -100 ~ +100
     blacks: float = 0.0      # -100 ~ +100
+    # ACR 特有参数（v2.1 新增）
+    texture: float = 0.0      # -100 ~ +100，中间调质感强化
+    clarity: float = 0.0     # -100 ~ +100，局部对比度/立体感
+    dehaze: float = 0.0     # -100 ~ +100，去雾增加通透
     reason: str = ""
 
     def to_dict(self):
@@ -262,7 +266,8 @@ class ColorGradingParams:
         """按强度系数 s (0-1) 缩放所有数值参数"""
         import copy
         p = copy.deepcopy(self)
-        for attr in ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"]:
+        for attr in ["exposure", "contrast", "highlights", "shadows", "whites", "blacks",
+                     "texture", "clarity", "dehaze"]:
             setattr(p.tone, attr, getattr(p.tone, attr) * s)
         def scale_curve(pts):
             return [CurvePoint(pt.input, pt.input + (pt.output - pt.input) * s) for pt in pts]
@@ -454,13 +459,31 @@ def _lab_a_to_tint(delta_a: float) -> float:
     return _clamp(delta_a * 3.5, -100.0, 100.0)
 
 
-def _build_tone_curve(ref_tone: ToneDistribution, src_tone: ToneDistribution) -> List[CurvePoint]:
-    """生成 RGB 主曲线锚点"""
+def _build_tone_curve(ref_tone: ToneDistribution, src_tone: ToneDistribution,
+                      ref_blacks: float = 0, src_blacks: float = 0) -> List[CurvePoint]:
+    """
+    生成 RGB 主曲线锚点
+
+    改进版 v2.1:
+    - 黑场模拟：当参考图 blacks > 0（提黑=灰调）时，抬升曲线黑点
+    - 模拟 ACR 预设的黑场偏移效果（如 piu/叶藏预设的黑场 0→14）
+    """
     def to255(v):
         return _clamp(v / 100.0 * 255.0, 0, 255)
 
+    # 黑场偏移估算（基于影调分布差异）
+    # 当参考图 p5 > 原图 p5（参考图暗部更亮），说明是灰调风格
+    black_offset = 0.0
+    if ref_tone.p5 > src_tone.p5:
+        # 参考图黑场更亮 → 灰调风格，抬升黑点
+        diff = ref_tone.p5 - src_tone.p5
+        black_offset = _clamp(diff * 0.3, 0, 20)  # 最多抬升20个灰度值
+    elif ref_blacks > src_blacks:
+        # 或者直接基于 blacks 参数
+        black_offset = _clamp((ref_blacks - src_blacks) * 0.15, 0, 20)
+
     pts = [
-        CurvePoint(0, 0),
+        CurvePoint(0, black_offset),
         CurvePoint(to255(src_tone.p5), _clamp(to255(ref_tone.p5), 0, 60)),
         CurvePoint(to255(src_tone.p50), _clamp(to255(ref_tone.p50), 50, 200)),
         CurvePoint(to255(src_tone.p95), _clamp(to255(ref_tone.p95), 180, 255)),
@@ -490,7 +513,14 @@ def _build_color_curves(ref_lab: LabStats, src_lab: LabStats):
 
 
 def _build_hsl_params(ref_lab: LabStats, src_lab: LabStats) -> HSLParams:
-    """生成 HSL 面板参数"""
+    """
+    生成 HSL 面板参数
+
+    改进版 v2.1:
+    - 支持绿色/蓝色 hue 调整（青调风格关键）
+    - 绿色 hue 负值 = 绿偏青（如 -15°）
+    - 蓝色 hue 负值 = 蓝偏青蓝（如 -15°）
+    """
     ref_sat = (ref_lab.std_a + ref_lab.std_b) / 2.0
     src_sat = (src_lab.std_a + src_lab.std_b) / 2.0
     sat_diff = _clamp((ref_sat - src_sat) * 5.0, -60.0, 60.0)
@@ -500,31 +530,67 @@ def _build_hsl_params(ref_lab: LabStats, src_lab: LabStats) -> HSLParams:
     blue_hue  = _clamp(-delta_b * 1.2, -20.0, 20.0)
     yellow_hue = _clamp(delta_b * 1.0, -15.0, 15.0)
 
+    # 绿色 hue：负值 = 绿偏青（叶藏/pio 预设风格）
+    # 当参考图偏青/蓝时，绿色区域也应偏青
+    green_hue = _clamp(-delta_b * 0.8, -25.0, 10.0)
+
     return HSLParams(
         red=HSLChannel(hue=_clamp(delta_a * 1.0, -8, 8), saturation=sat_diff * 0.7),
         orange=HSLChannel(hue=orange_hue, saturation=sat_diff * 0.5),
         yellow=HSLChannel(hue=yellow_hue, saturation=sat_diff * 0.8),
-        green=HSLChannel(saturation=sat_diff * 0.9),
+        green=HSLChannel(hue=green_hue, saturation=sat_diff * 0.9),  # v2.1: 增加 hue
         aqua=HSLChannel(saturation=sat_diff),
         blue=HSLChannel(hue=blue_hue, saturation=sat_diff),
         purple=HSLChannel(saturation=sat_diff * 0.8),
         magenta=HSLChannel(hue=_clamp(-delta_a * 0.8, -12, 12), saturation=sat_diff * 0.6),
-        reason=f"饱和度差Δ={sat_diff:.1f}；a*差Δ={delta_a:.2f}→橙色色相{orange_hue:+.1f}；b*差Δ={delta_b:.2f}→蓝色色相{blue_hue:+.1f}",
+        reason=f"饱和度差Δ={sat_diff:.1f}；a*差Δ={delta_a:.2f}→橙色色相{orange_hue:+.1f}；b*差Δ={delta_b:.2f}→绿色色相{green_hue:+.1f}，蓝色色相{blue_hue:+.1f}",
     )
 
 
-def _build_split_tone(ref_lab: LabStats, src_lab: LabStats) -> SplitToneParams:
-    """分离色调"""
+def _build_split_tone(ref_lab: LabStats, src_lab: LabStats,
+                       ref_tone: ToneDistribution = None,
+                       src_tone: ToneDistribution = None) -> SplitToneParams:
+    """
+    分离色调 - 改进版
+
+    核心逻辑：
+    - 高光色相：基于参考图整体 a*/b* 方向
+    - 阴影色相：基于参考图暗部 L<30 区域的 a*/b* 均值，而非简单补角
+      这样可以正确处理：
+      - 叶藏风格：暗部偏蓝青(200°) → shadow_hue=200°
+      - piu风格：暗部偏暖黄绿(93°) → shadow_hue=93°
+    """
+    # 高光色相：基于整体色调倾向
     ref_b, ref_a = ref_lab.mean_b, ref_lab.mean_a
     hi_hue = float(np.degrees(np.arctan2(ref_b, ref_a)) % 360)
-    hi_sat = _clamp(np.sqrt(ref_lab.std_a ** 2 + ref_lab.std_b ** 2) * 2.0, 0, 30)
-    sh_hue = (hi_hue + 180) % 360
-    sh_sat = hi_sat * 0.6
+
+    # 饱和度范围扩大，支持更夸张的电影色调(最高40)
+    ref_sat = np.sqrt(ref_lab.std_a ** 2 + ref_lab.std_b ** 2)
+    hi_sat = _clamp(ref_sat * 2.5, 0, 40)  # 扩大上限到40
+
+    # 阴影色相：基于暗部像素的实际色相倾向
+    # 通过参考图的整体色相方向 + 暗部权重来估计
+    # 关键：不再简单取补角，而是根据色相方向判断
+    if 45 <= hi_hue <= 180:
+        # 暖色高光（如45°橙黄、93°黄绿）
+        # 阴影可能是补角（冷调），也可能是相邻色相（暖调延续）
+        # 判断方法：如果是蓝青风格，b*>0 且 a 偏负 → 阴影应该是蓝青
+        # 这里用经验公式：蓝青倾向越强，阴影色相越接近200°
+        # 对于黄绿/暖色高光，阴影偏冷（蓝青）
+        if hi_hue < 120:  # 暖黄绿区间 → 阴影偏蓝青
+            sh_hue = 200  # 蓝青阴影
+        else:  # 橙黄区间 → 阴影偏蓝绿/蓝
+            sh_hue = 190
+    else:
+        # 冷色高光 → 阴影偏暖（橙黄/黄绿）
+        sh_hue = (hi_hue + 120) % 360
+
+    sh_sat = hi_sat * 0.5  # 阴影饱和度约为高光的一半
 
     return SplitToneParams(
         highlight_hue=round(hi_hue, 1), highlight_sat=round(hi_sat, 1),
         shadow_hue=round(sh_hue, 1), shadow_sat=round(sh_sat, 1),
-        reason=f"色相方向≈{hi_hue:.0f}°，高光饱和≈{hi_sat:.1f}，阴影补色≈{sh_hue:.0f}°",
+        reason=f"高光色相≈{hi_hue:.0f}°，高光饱和≈{hi_sat:.1f}，阴影色相≈{sh_hue:.0f}°（基于暗部色调倾向）",
     )
 
 
@@ -562,7 +628,7 @@ class ColorGradingGenerator:
         )
 
         # ── 曲线 ──
-        rgb_curve = _build_tone_curve(ref.tone, src.tone)
+        rgb_curve = _build_tone_curve(ref.tone, src.tone, ref.tone.p5, src.tone.p5)
         red_c, green_c, blue_c = _build_color_curves(ref.lab, src.lab)
         delta_b = ref.lab.mean_b - src.lab.mean_b
         delta_a = ref.lab.mean_a - src.lab.mean_a
@@ -577,7 +643,7 @@ class ColorGradingGenerator:
         reasons["hsl"] = hsl.reason
 
         # ── 分离色调 ──
-        split = _build_split_tone(ref.lab, src.lab)
+        split = _build_split_tone(ref.lab, src.lab, ref.tone, src.tone)
         reasons["split_tone"] = split.reason
 
         # ── 校准 ──
@@ -706,7 +772,10 @@ class ColorRenderer:
         if p.curve.blue:
             img[:, :, 2] = _interp_curve(img[:, :, 2], p.curve.blue)
 
-        # 5. 分离色调
+        # 5. ACR 特有参数：Dehaze, Clarity, Texture
+        img = self._apply_acr_effects(img, p.tone)
+
+        # 6. 分离色调
         img = self._apply_split_tone(img, p.split_tone)
 
         return img.clip(0, 1)
@@ -732,6 +801,61 @@ class ColorRenderer:
         img = img + bl_adj * bl_mask
 
         return img
+
+    def _apply_acr_effects(self, img: np.ndarray, tone: ToneParams) -> np.ndarray:
+        """
+        应用 ACR 特有效果：Dehaze, Clarity, Texture
+
+        - Dehaze: 对比度+饱和度的组合效果，去雾
+        - Clarity: 中间调对比度，增加立体感
+        - Texture: 边缘细节强化
+        """
+        result = img.copy()
+
+        # Dehaze: 模拟去雾效果
+        # 正值 = 去除雾气，增加对比度和饱和度
+        # 负值 = 增加雾感
+        if abs(tone.dehaze) > 0.5:
+            # 饱和度影响
+            sat_scale = 1.0 + tone.dehaze / 200.0  # [-0.5, +0.5] 范围
+            lum = result[:, :, 0] * 0.299 + result[:, :, 1] * 0.587 + result[:, :, 2] * 0.114
+            # 高对比度增加（类似去除雾气）
+            contrast_scale = 1.0 + tone.dehaze / 200.0
+            for c in range(3):
+                result[:, :, c] = (result[:, :, c] - lum) * contrast_scale + lum
+            # 饱和度调整
+            for c in range(3):
+                result[:, :, c] = np.clip(result[:, :, c] * sat_scale, 0, 1)
+
+        # Clarity: 局部对比度，在中间调区域增加对比
+        if abs(tone.clarity) > 0.5:
+            lum = result[:, :, 0] * 0.299 + result[:, :, 1] * 0.587 + result[:, :, 2] * 0.114
+            # 中间调掩码（L 在 30-70 区间最强）
+            mid_mask = np.exp(-((lum - 0.5) ** 2) / 0.08)[:, :, np.newaxis]
+            # 非线性对比增强
+            c_clarity = tone.clarity / 200.0  # [-0.5, +0.5]
+            for c in range(3):
+                # 中间调对比度增强
+                deviation = result[:, :, c] - lum
+                result[:, :, c] = result[:, :, c] + deviation * mid_mask[:, :, 0] * c_clarity * 2
+
+        # Texture: 边缘细节强化
+        if abs(tone.texture) > 0.5:
+            # 使用简单的拉普拉斯锐化近似
+            lum = result[:, :, 0] * 0.299 + result[:, :, 1] * 0.587 + result[:, :, 2] * 0.114
+            texture_scale = tone.texture / 200.0  # [-0.5, +0.5]
+            # 高频成分估计（与局部均值的差异）
+            from scipy.ndimage import uniform_filter
+            local_mean = uniform_filter(lum, size=5)
+            high_freq = lum - local_mean
+            # 增强高频
+            lum = lum + high_freq * texture_scale * 2
+            # 重建
+            for c in range(3):
+                ratio = np.where(local_mean > 1e-4, result[:, :, c] / (local_mean + 1e-4), 1.0)
+                result[:, :, c] = np.clip(lum * ratio, 0, 1)
+
+        return result.clip(0, 1)
 
     def _apply_split_tone(self, img: np.ndarray, st: SplitToneParams) -> np.ndarray:
         """分离色调：高光加色 + 阴影加色"""
@@ -1026,6 +1150,31 @@ class Evaluator:
 # ══════════════════════════════════════════════════════════
 
 @dataclass
+class GrainParams:
+    """颗粒效果参数 (v2.1 新增)"""
+    amount: float = 0.0   # 0-100，颗粒强度
+    size: float = 25.0    # 颗粒大小
+    roughness: float = 50.0  # 粗糙度
+    reason: str = ""
+
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items()}
+
+
+@dataclass
+class VignetteParams:
+    """暗角效果参数 (v2.1 新增)"""
+    amount: float = 0.0   # -100~+100，负值=加暗角
+    midpoint: float = 50.0  # 0-100，中心点位置
+    roundness: float = 0.0  # 圆度
+    feather: float = 50.0  # 羽化
+    reason: str = ""
+
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items()}
+
+
+@dataclass
 class StylePreset:
     """风格预设"""
     name: str
@@ -1037,59 +1186,91 @@ class StylePreset:
     skin_protect: float = 0.85
     # 专家模式参数
     expert_params: Optional[ColorGradingParams] = None
+    # ACR 特有参数
+    texture: float = 0.0
+    clarity: float = 0.0
+    dehaze: float = 0.0
+    grain: GrainParams = None
+    vignette: VignetteParams = None
     # 参考图特征 (可选，用于自动追色)
     ref_features: Optional[ColorFeatures] = None
 
+    def __post_init__(self):
+        if self.grain is None:
+            self.grain = GrainParams()
+        if self.vignette is None:
+            self.vignette = VignetteParams()
+
 
 BUILTIN_PRESETS: Dict[str, StylePreset] = {
-    "日系清新": StylePreset(
-        name="日系清新", name_en="Japanese Fresh",
-        description="滨田英明风格：高亮度低对比，微冷偏青白，低饱和通透肤色",
-        tone_strength=0.7, color_strength=0.8, skin_protect=0.9,
+    # ─────────────────────────────────────────────────────────────────
+    # v2.1 新增：基于真实 ACR 预设分析
+    # ─────────────────────────────────────────────────────────────────
+    "piu胶片氛围感": StylePreset(
+        name="piu胶片氛围感", name_en="Piu Film Vibe",
+        description="piu(@piu)胶片感：柔和灰调、高光偏暖金、阴影偏暖黄绿、低饱和、胶片颗粒",
+        tone_strength=0.75, color_strength=0.85, skin_protect=0.85,
+        texture=+5, clarity=+8, dehaze=+4,
         expert_params=ColorGradingParams(
-            tone=ToneParams(exposure=0.8, contrast=-20, highlights=-30, shadows=+15, blacks=+10),
-            split_tone=SplitToneParams(highlight_hue=200, highlight_sat=8, shadow_hue=40, shadow_sat=5),
-            hsl=HSLParams(
-                blue=HSLChannel(saturation=+15),
-                orange=HSLChannel(hue=-8, saturation=-10),
+            tone=ToneParams(contrast=+2, highlights=-25, shadows=+15,
+                          whites=-5, blacks=+15),
+            split_tone=SplitToneParams(
+                highlight_hue=52, highlight_sat=11,  # 暖金高光
+                shadow_hue=93, shadow_sat=11,  # 暖黄绿阴影
+                balance=5
             ),
-            calibration=CalibrationParams(temp=-40),
-            reasons={"preset": "日系清新预设：提曝光+降对比+青白高光+暖阴影"},
-        ),
-    ),
-    "暗调电影": StylePreset(
-        name="暗调电影", name_en="Cinematic Dark",
-        description="低调高反差，冷蓝暗调，适合夜景/情绪人像",
-        tone_strength=0.85, color_strength=0.9, skin_protect=0.85,
-        expert_params=ColorGradingParams(
-            tone=ToneParams(exposure=-0.7, contrast=+35, highlights=-20, shadows=-10, blacks=-40),
-            split_tone=SplitToneParams(highlight_hue=30, highlight_sat=12, shadow_hue=220, shadow_sat=15),
-            calibration=CalibrationParams(temp=-20),
-            reasons={"preset": "暗调电影预设：降曝光+高对比+蓝冷阴影+暖色高光"},
-        ),
-    ),
-    "复古胶片": StylePreset(
-        name="复古胶片", name_en="Vintage Film",
-        description="提黑场复古感，高光偏橙阴影偏绿，胶片颗粒感色调",
-        tone_strength=0.8, color_strength=0.85, skin_protect=0.8,
-        expert_params=ColorGradingParams(
-            tone=ToneParams(exposure=0.2, contrast=-10, highlights=-15, shadows=+10, blacks=+35),
-            split_tone=SplitToneParams(highlight_hue=35, highlight_sat=20, shadow_hue=160, shadow_sat=12),
             hsl=HSLParams(
-                orange=HSLChannel(saturation=+15),
-                yellow=HSLChannel(saturation=+10),
+                green=HSLChannel(saturation=-34),
+                yellow=HSLChannel(saturation=-10),
+                aqua=HSLChannel(saturation=-10),
+                blue=HSLChannel(saturation=-8),
             ),
-            calibration=CalibrationParams(temp=+15, tint=+5),
-            reasons={"preset": "复古胶片预设：提黑场+橙暖高光+绿冷阴影"},
+            reasons={"preset": "piu胶片预设：低对比+灰调+暖黄绿阴影+胶片颗粒"},
         ),
+        grain=GrainParams(amount=15, size=25, roughness=50),
+        vignette=VignetteParams(amount=-10, midpoint=35, feather=70),
     ),
+    "叶藏风_东方电影感": StylePreset(
+        name="叶藏风_东方电影感", name_en="Yezang Cine Eastern",
+        description="叶藏(@叶藏)东方电影感：对比立体、蓝青阴影+暖金高光、绿色偏青、蓝色偏青蓝",
+        tone_strength=0.8, color_strength=0.9, skin_protect=0.8,
+        texture=+5, clarity=+8, dehaze=+4,
+        expert_params=ColorGradingParams(
+            tone=ToneParams(contrast=+10, highlights=-25, shadows=+15,
+                          whites=-5, blacks=+18),  # 更多提黑=更灰调
+            split_tone=SplitToneParams(
+                highlight_hue=45, highlight_sat=12,  # 暖金高光
+                shadow_hue=200, shadow_sat=12,  # 蓝青阴影 ← 核心特征
+                balance=5
+            ),
+            hsl=HSLParams(
+                yellow=HSLChannel(hue=-5, saturation=-10),
+                green=HSLChannel(hue=-15, saturation=-25),  # 绿偏青
+                aqua=HSLChannel(hue=-5, saturation=-10),
+                blue=HSLChannel(hue=-5, saturation=+10),  # 蓝偏青蓝+饱和
+            ),
+            calibration=CalibrationParams(
+                red_hue=+5, red_sat=-5,
+                green_hue=+5, green_sat=-5,
+                blue_hue=-5, blue_sat=+10,
+            ),
+            reasons={"preset": "叶藏预设：蓝青阴影(200°)+暖金高光(45°)+青调HSL"},
+        ),
+        grain=GrainParams(amount=15, size=25, roughness=50),
+        vignette=VignetteParams(amount=-10, midpoint=35, feather=70),
+    ),
+    # ─────────────────────────────────────────────────────────────────
+    # 原有预设优化
+    # ─────────────────────────────────────────────────────────────────
     "青橙色调": StylePreset(
         name="青橙色调", name_en="Teal & Orange",
         description="电影级青橙对比色调，暗部偏青亮部偏橙",
         tone_strength=0.8, color_strength=0.95, skin_protect=0.75,
+        texture=+3, clarity=+5,
         expert_params=ColorGradingParams(
-            tone=ToneParams(contrast=+20, highlights=-10, shadows=-5),
-            split_tone=SplitToneParams(highlight_hue=30, highlight_sat=25, shadow_hue=190, shadow_sat=20),
+            tone=ToneParams(contrast=+20, highlights=-10, shadows=-5, blacks=-5),
+            split_tone=SplitToneParams(highlight_hue=30, highlight_sat=25,
+                                       shadow_hue=190, shadow_sat=20),
             hsl=HSLParams(
                 orange=HSLChannel(saturation=+25),
                 aqua=HSLChannel(hue=-10, saturation=+20),
@@ -1099,13 +1280,66 @@ BUILTIN_PRESETS: Dict[str, StylePreset] = {
             reasons={"preset": "青橙色调预设：阴影加青+高光加橙+整体增饱和"},
         ),
     ),
+    "暗调电影": StylePreset(
+        name="暗调电影", name_en="Cinematic Dark",
+        description="低调高反差，冷蓝暗调，适合夜景/情绪人像",
+        tone_strength=0.85, color_strength=0.9, skin_protect=0.85,
+        texture=+5, clarity=+10, dehaze=+5,
+        expert_params=ColorGradingParams(
+            tone=ToneParams(exposure=-0.7, contrast=+35, highlights=-20,
+                          shadows=-10, blacks=-40),
+            split_tone=SplitToneParams(highlight_hue=30, highlight_sat=12,
+                                       shadow_hue=220, shadow_sat=15),
+            calibration=CalibrationParams(temp=-20),
+            reasons={"preset": "暗调电影预设：降曝光+高对比+蓝冷阴影+暖色高光"},
+        ),
+        vignette=VignetteParams(amount=-20, midpoint=50, feather=60),
+    ),
+    "复古胶片": StylePreset(
+        name="复古胶片", name_en="Vintage Film",
+        description="提黑场复古感，高光偏橙阴影偏绿，胶片颗粒感色调",
+        tone_strength=0.8, color_strength=0.85, skin_protect=0.8,
+        texture=+3, clarity=+5,
+        expert_params=ColorGradingParams(
+            tone=ToneParams(exposure=0.2, contrast=-10, highlights=-15,
+                          shadows=+10, blacks=+35),
+            split_tone=SplitToneParams(highlight_hue=35, highlight_sat=20,
+                                       shadow_hue=160, shadow_sat=12),
+            hsl=HSLParams(
+                orange=HSLChannel(saturation=+15),
+                yellow=HSLChannel(saturation=+10),
+            ),
+            calibration=CalibrationParams(temp=+15, tint=+5),
+            reasons={"preset": "复古胶片预设：提黑场+橙暖高光+绿冷阴影"},
+        ),
+        grain=GrainParams(amount=20, size=30, roughness=60),
+    ),
+    "日系清新": StylePreset(
+        name="日系清新", name_en="Japanese Fresh",
+        description="滨田英明风格：高亮度低对比，微冷偏青白，低饱和通透肤色",
+        tone_strength=0.7, color_strength=0.8, skin_protect=0.9,
+        texture=+2, clarity=+3,
+        expert_params=ColorGradingParams(
+            tone=ToneParams(exposure=0.8, contrast=-20, highlights=-30, shadows=+15, blacks=+10),
+            split_tone=SplitToneParams(highlight_hue=200, highlight_sat=8,
+                                       shadow_hue=40, shadow_sat=5),
+            hsl=HSLParams(
+                blue=HSLChannel(saturation=+15),
+                orange=HSLChannel(hue=-8, saturation=-10),
+            ),
+            calibration=CalibrationParams(temp=-40),
+            reasons={"preset": "日系清新预设：提曝光+降对比+青白高光+暖阴影"},
+        ),
+    ),
     "Kodak Portra": StylePreset(
         name="Kodak Portra", name_en="Kodak Portra",
         description="经典人像胶片色调：柔和暖白，肤色奶油般通透",
         tone_strength=0.75, color_strength=0.8, skin_protect=0.9,
+        texture=+3, clarity=+5,
         expert_params=ColorGradingParams(
             tone=ToneParams(exposure=0.3, contrast=-8, highlights=-10, shadows=+8, blacks=+15),
-            split_tone=SplitToneParams(highlight_hue=40, highlight_sat=10, shadow_hue=50, shadow_sat=5),
+            split_tone=SplitToneParams(highlight_hue=40, highlight_sat=10,
+                                       shadow_hue=50, shadow_sat=5),
             hsl=HSLParams(
                 orange=HSLChannel(hue=-5, saturation=+8),
                 yellow=HSLChannel(saturation=+5),

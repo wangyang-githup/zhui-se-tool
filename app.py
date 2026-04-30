@@ -9,6 +9,7 @@ CustomTkinter 紫色暗色主题
 
 import os
 import sys
+import queue
 import threading
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -88,6 +89,8 @@ class App(ctk.CTk):
         self.ref_path = ""
         self.src_path = ""
         self._processing = False
+        self._lock = threading.Lock()
+        self._work_queue = queue.Queue()
 
         # 构建UI
         self._build_ui()
@@ -524,16 +527,17 @@ class App(ctk.CTk):
         self._run_transfer_async()
 
     def _run_transfer_async(self):
-        if self._processing:
-            return
         if self.ref_img_np is None or self.src_img_np is None:
             return
+        with self._lock:
+            if self._processing:
+                return
+            self._processing = True
 
-        self._processing = True
         mode = self._get_mode()
         src_copy = self.src_img_np.copy()
 
-        # 提前读取参数
+        # 提前读取参数（主线程安全操作 Variable.get）
         if mode == "simple":
             params = {
                 "mode": "simple",
@@ -544,7 +548,6 @@ class App(ctk.CTk):
                 "strength": self._strength_var.get(),
             }
         else:
-            # 构建专家参数
             grading = ColorGradingParams(
                 tone=ToneParams(
                     exposure=self._exposure_var.get(),
@@ -573,36 +576,40 @@ class App(ctk.CTk):
                 "strength": self._strength_var.get(),
             }
 
+        self._work_queue.put(params)
+
         def work():
             self.after(0, lambda: self._set_status("⏳ 追色中..."))
             try:
-                if params["mode"] == "simple":
+                p = self._work_queue.get()
+
+                if p["mode"] == "simple":
                     result = self.engine.render(
                         src_copy,
                         mode="simple",
-                        tone_strength=params["tone_strength"],
-                        color_strength=params["color_strength"],
-                        skin_protect=params["skin_protect"],
-                        use_skin_protect=params["use_skin_protect"],
+                        tone_strength=p["tone_strength"],
+                        color_strength=p["color_strength"],
+                        skin_protect=p["skin_protect"],
+                        use_skin_protect=p["use_skin_protect"],
                     )
                 else:
                     result = self.engine.render(
                         src_copy,
                         mode="expert",
-                        strength=params["strength"],
-                        params=params["grading"],
+                        strength=p["strength"],
+                        params=p["grading"],
                     )
 
                 self.result_np = result
-                # 评价
                 eval_result = self.engine.evaluate(src_copy, result)
 
                 def update_ui():
                     self._show_preview("result", result)
-                    mode_text = "简化" if params["mode"] == "simple" else "专家"
+                    mode_text = "简化" if p["mode"] == "simple" else "专家"
                     self._set_status(f"✓ 追色完成 ({mode_text}模式)")
                     if "summary" in eval_result:
                         self._eval_label.configure(text=f"📊 {eval_result['summary']}")
+                    self._reset_processing()
 
                 self.after(0, update_ui)
             except Exception as e:
@@ -611,51 +618,54 @@ class App(ctk.CTk):
                 print(f"追色异常:\n{tb}")
                 self.after(0, lambda: self._set_status(f"✗ 追色失败：{e}"))
                 self.after(0, lambda: messagebox.showerror("追色失败", f"{e}\n\n{tb}"))
-            finally:
-                self._processing = False
+                self.after(0, self._reset_processing)
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _reset_processing(self):
+        with self._lock:
+            self._processing = False
+
     def _auto_analyze(self):
-        """自动分析差异并填充专家参数"""
+        """自动分析差异并填充专家参数（异步）"""
         if not self._check_ready():
             return
 
-        try:
-            from color_engine import FeatureExtractor, ColorGradingGenerator
-            extractor = FeatureExtractor()
-            generator = ColorGradingGenerator()
-            ref_feat = self.engine.ref_features
-            src_feat = extractor.extract(self.src_img_np)
-            params = generator.generate(ref_feat, src_feat, strength=self._strength_var.get())
+        self._set_status("⏳ 分析中...")
 
-            # 填充 GUI 参数
-            self._exposure_var.set(params.tone.exposure)
-            self._contrast_var.set(params.tone.contrast)
-            self._highlights_var.set(params.tone.highlights)
-            self._shadows_var.set(params.tone.shadows)
-            self._whites_var.set(params.tone.whites)
-            self._blacks_var.set(params.tone.blacks)
-            self._hi_hue_var.set(params.split_tone.highlight_hue)
-            self._hi_sat_var.set(params.split_tone.highlight_sat)
-            self._sh_hue_var.set(params.split_tone.shadow_hue)
-            self._sh_sat_var.set(params.split_tone.shadow_sat)
-            self._temp_var.set(params.calibration.temp)
-            self._tint_var.set(params.calibration.tint)
+        def work():
+            try:
+                from color_engine import FeatureExtractor, ColorGradingGenerator
+                extractor = FeatureExtractor()
+                generator = ColorGradingGenerator()
+                ref_feat = self.engine.ref_features
+                src_feat = extractor.extract(self.src_img_np)
+                params = generator.generate(ref_feat, src_feat, strength=self._strength_var.get())
 
-            # 切换到专家模式
-            self._mode_var.set("专家")
+                def update_ui():
+                    self._exposure_var.set(params.tone.exposure)
+                    self._contrast_var.set(params.tone.contrast)
+                    self._highlights_var.set(params.tone.highlights)
+                    self._shadows_var.set(params.tone.shadows)
+                    self._whites_var.set(params.tone.whites)
+                    self._blacks_var.set(params.tone.blacks)
+                    self._hi_hue_var.set(params.split_tone.highlight_hue)
+                    self._hi_sat_var.set(params.split_tone.highlight_sat)
+                    self._sh_hue_var.set(params.split_tone.shadow_hue)
+                    self._sh_sat_var.set(params.split_tone.shadow_sat)
+                    self._temp_var.set(params.calibration.temp)
+                    self._tint_var.set(params.calibration.tint)
+                    self._mode_var.set("专家")
+                    reasons = params.reasons
+                    reason_text = "\n".join(f"• {v}" for v in reasons.values() if v)
+                    self._set_status(f"✓ 自动分析完成，已填充参数\n{reason_text}")
+                    self._run_transfer_async()
 
-            # 显示调整理由
-            reasons = params.reasons
-            reason_text = "\n".join(f"• {v}" for v in reasons.values() if v)
-            self._set_status(f"✓ 自动分析完成，已填充参数\n{reason_text}")
+                self.after(0, update_ui)
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("分析失败", f"{e}"))
 
-            # 自动追色
-            self._run_transfer_async()
-
-        except Exception as e:
-            messagebox.showerror("分析失败", f"{e}")
+        threading.Thread(target=work, daemon=True).start()
 
     def _apply_preset(self, name):
         """应用风格预设"""

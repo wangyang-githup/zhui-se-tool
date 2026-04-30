@@ -38,7 +38,7 @@ _XYZ_W = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
 def _gamma_correct(c: np.ndarray) -> np.ndarray:
     """线性化 sRGB gamma 曲线"""
     out = np.where(c > 0.0031308,
-                    1.055 * np.power(np.clip(c, 1e-8), 1.0 / 2.4) - 0.055,
+                    1.055 * np.power(np.maximum(c, 1e-8), 1.0 / 2.4) - 0.055,
                     12.92 * c)
     return np.clip(out, 0.0, 1.0)
 
@@ -232,6 +232,10 @@ class ColorTransfer:
         if self.ref_stats is None:
             raise ValueError("请先调用 analyze() 分析参考图")
 
+        # 限制强度范围，防止数值溢出
+        tone_strength = np.clip(tone_strength, 0.0, 2.0)
+        color_strength = np.clip(color_strength, 0.0, 2.0)
+
         s = self.ref_stats
         src_lab = rgb_to_lab(src_img)
         result_lab = src_lab.copy()
@@ -258,18 +262,23 @@ class ColorTransfer:
         transferred_b = (src_b - src_mean_b) * (s['std_b'] / (src_std_b + eps)) + s['mean_b']
         result_lab[:, :, 2] = src_b + color_strength * (transferred_b - src_b)
 
-        result_lab[:, :, 0] = result_lab[:, :, 0].clip(0, 100)
-        result_lab[:, :, 1] = result_lab[:, :, 1].clip(-128, 127)
-        result_lab[:, :, 2] = result_lab[:, :, 2].clip(-128, 127)
+        # 严格限制Lab值范围
+        result_lab[:, :, 0] = np.clip(result_lab[:, :, 0], 0, 100)
+        result_lab[:, :, 1] = np.clip(result_lab[:, :, 1], -128, 127)
+        result_lab[:, :, 2] = np.clip(result_lab[:, :, 2], -128, 127)
 
         result_rgb = lab_to_rgb(result_lab)
+
+        # 处理NaN/Inf
+        result_rgb = np.nan_to_num(result_rgb, nan=0.5, posinf=1.0, neginf=0.0)
+        result_rgb = np.clip(result_rgb, 0.0, 1.0)
 
         if use_skin_protect and skin_protect > 0:
             mask = skin_mask(src_img)
             protect = mask[:, :, np.newaxis] * skin_protect
             result_rgb = result_rgb * (1.0 - protect) + src_img * protect
 
-        return result_rgb.clip(0.0, 1.0)
+        return np.clip(result_rgb, 0.0, 1.0)
 
 
 # ═══════════════════════════════════════════════════════

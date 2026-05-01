@@ -288,7 +288,7 @@ class ZsTrackerApp:
         # 结果图底部标签
         if is_result:
             result_tag = tk.Label(card, text="原图", font=("PingFang SC", 9),
-                                  bg="rgba(0,0,0,0.5)", fg=self.TEXT_MAIN)
+                                  bg=self.BG_DARK, fg=self.TEXT_MUTE)
             result_tag.place(relx=0.98, rely=0.98, anchor="se", x=-12, y=-12)
             self.result_tag = result_tag
 

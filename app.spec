@@ -1,25 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 追色工具 打包配置 (v2.0 — 无OpenCV)
-# 用法: pyinstaller app.spec
+# 追色工具 打包配置 (v2.1 — 模块化 + 无OpenCV)
+# 用法: pyinstaller app.spec --clean -y
 
 import os
-import sys
 
 block_cipher = None
 
 project_root = os.path.dirname(os.path.abspath(SPEC))
-
-# CustomTkinter 资源文件
-import customtkinter as ctk
-ctk_assets = os.path.join(os.path.dirname(ctk.__file__), 'assets')
 
 a = Analysis(
     [os.path.join(project_root, 'app.py')],
     pathex=[project_root],
     binaries=[],
     datas=[
-        # CustomTkinter 资源（必须打包，否则界面灰色）
-        (ctk_assets, 'customtkinter/assets'),
+        # 预设文件
+        (os.path.join(project_root, 'presets.json'), '.'),
     ],
     hiddenimports=[
         'numpy',
@@ -38,8 +33,11 @@ a = Analysis(
         'sklearn.utils._vector_sentinel',
         'sklearn.neighbors',
         'sklearn.neighbors._partition_nodes',
-        'customtkinter',
         'color_engine',
+        'feature_extractor',
+        'grading_generator',
+        'color_renderer',
+        'evaluator',
         'threading',
     ],
     hookspath=[],
@@ -90,8 +88,8 @@ app = BUNDLE(
         'CFBundleName': '追色工具',
         'CFBundleDisplayName': '追色工具',
         'CFBundleIdentifier': 'com.zhuisse.color-tool',
-        'CFBundleVersion': '2.0.0',
-        'CFBundleShortVersionString': '2.0.0',
+        'CFBundleVersion': '2.1.0',
+        'CFBundleShortVersionString': '2.1.0',
         'CFBundlePackageType': 'APPL',
         'CFBundleExecutable': '追色工具',
         'LSMinimumSystemVersion': '10.15',

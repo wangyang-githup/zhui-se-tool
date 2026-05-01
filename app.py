@@ -1,781 +1,939 @@
 """
-追色工具 — 主界面 (app.py) v2.0
-=====================================
-CustomTkinter 紫色暗色主题
-统一引擎 (ZhuiseEngine) — 简化模式 + 专家模式 + 风格预设
+追色 - AI智能配色工具 v2.1
+新布局：左侧70%预览 + 右侧30%工具栏
 
-使用方法: python3 app.py
+功能：
+1. 参考图导入 - 加载目标色调的参考图片
+2. 色彩分析 - 提取参考图和原片的色彩特征
+3. 智能追色 - Lab空间色彩迁移 + ΔE肤色保护
+4. 预设系统 - 8组内置预设一键套用
+5. LUT导出 - 导出.cube格式的LUT文件
+
+无OpenCV依赖，纯PIL + NumPy + scipy实现
 """
 
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image
+from PIL import ImageTk, ImageDraw
+import numpy as np
 import os
-import sys
+import json
 import threading
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
-from PIL import Image as PILImage, ImageTk
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict
 
-# 确保当前目录在搜索路径中
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from color_engine import (
-    ZhuiseEngine, load_image, save_image, BUILTIN_PRESETS,
-    ColorGradingParams, ToneParams,
-)
-
-
-# ══════════════════════════════════════════════════════════
-#  主题配色 (Catppuccin Mocha)
-# ══════════════════════════════════════════════════════════
-
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("dark-blue")
-
-C = {
-    "bg":        "#1e1e2e",
-    "surface":   "#313244",
-    "overlay":   "#45475a",
-    "text":      "#cdd6f4",
-    "subtext":   "#6c7086",
-    "accent":    "#cba6f7",
-    "accent2":   "#b4befe",
-    "green":     "#a6e3a1",
-    "red":       "#f38ba8",
-    "blue":      "#89b4fa",
-    "yellow":    "#f9e2af",
-    "peach":     "#fab387",
-    "card":      "#242438",
-    "border":    "#45475a",
-}
+# 导入自定义模块
+from color_engine import ColorTransfer, load_image, save_image
+from feature_extractor import FeatureExtractor
+from grading_generator import ColorGradingGenerator
+from color_renderer import ColorRenderer
+from evaluator import Evaluator
 
 
-# ══════════════════════════════════════════════════════════
-#  工具函数
-# ══════════════════════════════════════════════════════════
+class ProgressWindow:
+    """带动画的进度窗口"""
 
-def np_to_ctk_image(arr, max_w=380, max_h=280):
-    """float32 RGB [0,1] → CTkImage 预览"""
-    u8 = (arr.clip(0, 1) * 255).astype('uint8')
-    pil = PILImage.fromarray(u8, mode="RGB")
-    w, h = pil.size
-    scale = min(max_w / w, max_h / h, 1.0)
-    if scale < 1.0:
-        pil = pil.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
-    return ctk.CTkImage(light_image=pil, dark_image=pil, size=pil.size)
+    def __init__(self, parent, title: str = "处理中"):
+        self.window = tk.Toplevel(parent)
+        self.window.title(title)
+        self.window.geometry("400x120")
+        self.window.resizable(False, False)
+        self.window.transient(parent)
+        self.window.grab_set()
+
+        x = (self.window.winfo_screenwidth() - 400) // 2
+        y = (self.window.winfo_screenheight() - 120) // 2
+        self.window.geometry(f"400x120+{x}+{y}")
+
+        self.label = ttk.Label(self.window, text="正在处理...", font=("Arial", 11))
+        self.label.pack(pady=(15, 5))
+
+        self.progress = ttk.Progressbar(self.window, mode="indeterminate", length=350)
+        self.progress.pack(pady=5)
+        self.progress.start(10)
+
+        self.percent_label = ttk.Label(self.window, text="0%", font=("Arial", 10))
+        self.percent_label.pack(pady=5)
+
+    def update_text(self, text: str, percent: int = None):
+        self.label.configure(text=text)
+        if percent is not None:
+            self.percent_label.configure(text=f"{percent}%")
+        self.window.update()
+
+    def close(self):
+        self.progress.stop()
+        self.window.destroy()
 
 
-# ══════════════════════════════════════════════════════════
-#  主应用
-# ══════════════════════════════════════════════════════════
+class ZsTrackerApp:
+    """追色工具主应用 - v2.1 新布局"""
 
-class App(ctk.CTk):
-    PREVIEW_W = 380
-    PREVIEW_H = 280
+    # 配色方案
+    BG_DARK    = "#0a0a0b"
+    BG_CARD    = "#141416"
+    BG_INPUT   = "#1a1a1c"
+    BORDER     = "#2a2a2e"
+    TEXT_MAIN  = "#ffffff"
+    TEXT_MUTE  = "#888888"
+    TEXT_HINT  = "#555555"
+    ACCENT     = "#3b82f6"
+    ORANGE     = "#f59e0b"
+    GREEN      = "#22c55e"
+    RED        = "#ef4444"
+    BTN_BG     = "#3b82f6"
+    BTN_HOVER  = "#2563eb"
 
-    def __init__(self):
-        super().__init__()
-        self.title("追色工具  ✦  Zhuise Color Matcher")
-        self.configure(fg_color=C["bg"])
-        self.resizable(True, True)
-        self.minsize(1200, 750)
-        self.geometry("1350x800")
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("追色 v2.1 - AI智能配色工具")
+        self.root.configure(bg=self.BG_DARK)
+        self.root.geometry("1400x820")
+        self.root.minsize(1200, 750)
 
-        # 引擎
-        self.engine = ZhuiseEngine()
+        # 加载预设
+        self._load_presets()
 
-        # 状态
-        self.ref_img_np = None
-        self.src_img_np = None
-        self.result_np = None
-        self.ref_path = ""
-        self.src_path = ""
-        self._processing = False
+        # 状态变量
+        self.reference_path: Optional[str] = None
+        self.reference_img: Optional[np.ndarray] = None
+        self.target_imgs: List[Tuple[str, np.ndarray]] = []
+        self.current_result: Optional[np.ndarray] = None
+        self.current_index = 0
+        self.output_dir = os.path.expanduser("~/Desktop")
+        self.selected_preset: Optional[Dict] = None
 
-        # 构建UI
-        self._build_ui()
+        # 专业模块
+        self.feature_extractor = FeatureExtractor()
+        self.grading_generator = ColorGradingGenerator()
+        self.color_renderer = ColorRenderer()
+        self.ref_features = None
+
+        # 调色参数
+        self.skin_protection = tk.BooleanVar(value=True)
+        self.skin_strength = tk.DoubleVar(value=0.80)
+        self.tone_strength = tk.DoubleVar(value=0.8)
+        self.color_strength = tk.DoubleVar(value=0.9)
+        self.lut_size = tk.IntVar(value=33)
+        self.mode = tk.StringVar(value="quick")
+        self.auto_preview = tk.BooleanVar(value=False)
+
+        # 指标变量
+        self.metric_delta_e = tk.StringVar(value="—")
+        self.metric_skin = tk.StringVar(value="—")
+        self.metric_speed = tk.StringVar(value="—")
+        self.metric_coverage = tk.StringVar(value="—")
+
+        # 预览图引用（防止GC）
+        self.preview_labels = {}
+
+        # 快捷键绑定
+        self.root.bind("<Command-Return>", lambda e: self.start_color_transfer())
+        self.root.bind("<Control-Return>", lambda e: self.start_color_transfer())
+
+        self._init_ui()
+
+    def _load_presets(self):
+        """加载预设配置"""
+        preset_path = Path(__file__).parent / "presets.json"
+        if preset_path.exists():
+            with open(preset_path, encoding="utf-8") as f:
+                data = json.load(f)
+                self.presets = data.get("presets", [])
+                self.preset_categories = data.get("categories", {})
+        else:
+            self.presets = []
+            self.preset_categories = {}
 
     # ──────────────────────────────────────────
-    #  UI 构建
+    #  UI 初始化
     # ──────────────────────────────────────────
 
-    def _build_ui(self):
-        # ── 顶栏 ──
-        header = ctk.CTkFrame(self, fg_color=C["bg"], height=50)
-        header.pack(fill="x", padx=20, pady=(14, 4))
+    def _init_ui(self):
+        """初始化UI - 70/30新布局"""
+        self._setup_styles()
+
+        # 顶部工具栏
+        self._build_header()
+
+        # 主内容区
+        content = tk.Frame(self.root, bg=self.BG_DARK)
+        content.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        # 左侧预览区（70%）
+        left = tk.Frame(content, bg=self.BG_DARK)
+        left.pack(side="left", fill="both", expand=True)
+        self._build_preview_area(left)
+
+        # 右侧工具栏（30%，固定380px）
+        right = tk.Frame(content, bg=self.BG_DARK, width=380)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+        self._build_tools(right)
+
+        # 底部状态栏
+        status_bar = tk.Frame(self.root, bg="#111113", height=28)
+        status_bar.pack(fill="x", side="bottom")
+        self.status_var = tk.StringVar(value="就绪 — 导入参考图和原图开始追色")
+        tk.Label(status_bar, textvariable=self.status_var,
+                 font=("PingFang SC", 10), bg="#111113", fg="#6c7086",
+                 anchor="w", padx=16).pack(fill="x", side="left")
+
+    def _setup_styles(self):
+        """配置ttk样式"""
+        style = ttk.Style()
+        style.configure("Dark.TRadiobutton", background=self.BG_DARK, foreground=self.TEXT_MAIN)
+        # 滚动条样式
+        style.configure("Dark.Horizontal.TScrollbar", background=self.BORDER)
+
+    def _build_header(self):
+        """顶部工具栏"""
+        header = tk.Frame(self.root, bg=self.BG_CARD, height=50)
+        header.pack(fill="x", padx=12, pady=(12, 0))
         header.pack_propagate(False)
 
-        ctk.CTkLabel(
-            header, text="✦ 追色工具", font=ctk.CTkFont(family="PingFang SC", size=22, weight="bold"),
-            text_color=C["accent"]
-        ).pack(side="left")
+        # Logo
+        tk.Label(header, text="追色", font=("PingFang SC", 15, "bold"),
+                 bg=self.BG_CARD, fg=self.TEXT_MAIN).pack(side="left", padx=(12, 0))
 
-        ctk.CTkLabel(
-            header, text="Zhuise Color Matcher  |  Lab 色彩迁移 + 肤色保护 + 专家管线",
-            font=ctk.CTkFont(family="PingFang SC", size=11),
-            text_color=C["subtext"]
-        ).pack(side="left", padx=14)
+        # 导航标签
+        nav_frame = tk.Frame(header, bg=self.BG_CARD)
+        nav_frame.pack(side="left", padx=20)
+        for label in ["预设", "批量", "历史"]:
+            tk.Label(nav_frame, text=label, font=("PingFang SC", 12),
+                     bg=self.BG_CARD, fg=self.TEXT_MUTE, cursor="hand2").pack(side="left", padx=12)
 
-        # 模式切换
-        self._mode_var = ctk.StringVar(value="expert")
-        mode_frame = ctk.CTkFrame(header, fg_color="transparent")
-        mode_frame.pack(side="right")
-        ctk.CTkSegmentedButton(
-            mode_frame, values=["简化", "专家"],
-            variable=self._mode_var, command=self._on_mode_change,
-            font=ctk.CTkFont(family="PingFang SC", size=11),
-            selected_color=C["accent"], selected_hover_color=C["accent2"],
-            fg_color=C["surface"], unselected_color=C["surface"],
-        ).pack()
+        # 右侧信息
+        info_frame = tk.Frame(header, bg=self.BG_CARD)
+        info_frame.pack(side="right", padx=12)
 
-        # ── 主区域 ──
-        main = ctk.CTkFrame(self, fg_color=C["bg"])
-        main.pack(fill="both", expand=True, padx=20, pady=4)
+        self.img_info_label = tk.Label(info_frame, text="",
+                                       font=("PingFang SC", 10), bg=self.BG_CARD, fg=self.TEXT_MUTE)
+        self.img_info_label.pack(side="left", padx=12)
 
-        # 左栏：图片预览
-        left = ctk.CTkFrame(main, fg_color=C["bg"])
-        left.pack(side="left", fill="both", expand=True)
-        self._build_preview_panel(left)
+        tk.Button(info_frame, text="导出", font=("PingFang SC", 11),
+                  bg=self.ACCENT, fg=self.TEXT_MAIN, bd=0, padx=14, pady=5,
+                  cursor="hand2", command=self.save_result).pack(side="right")
 
-        # 右栏：参数控制
-        right = ctk.CTkFrame(main, fg_color=C["bg"], width=320)
-        right.pack(side="right", fill="y", padx=(12, 0))
-        right.pack_propagate(False)
-        self._build_control_panel(right)
+    def _build_preview_area(self, parent):
+        """左侧预览区：三联对比 + 底部指标"""
+        preview_container = tk.Frame(parent, bg=self.BG_CARD)
+        preview_container.pack(fill="both", expand=True, pady=(0, 10))
 
-        # ── 底部状态栏 ──
-        self._status_var = ctk.StringVar(value="就绪 — 请导入参考图和原图")
-        status_bar = ctk.CTkFrame(self, fg_color="#181825", height=32)
-        status_bar.pack(fill="x", side="bottom")
-        status_bar.pack_propagate(False)
-        ctk.CTkLabel(
-            status_bar, textvariable=self._status_var,
-            font=ctk.CTkFont(family="PingFang SC", size=10),
-            text_color=C["subtext"], anchor="w"
-        ).pack(fill="x", padx=16, side="left")
-
-    # ── 图片预览区 ──
-
-    def _build_preview_panel(self, parent):
-        """三格预览: 参考图 | 原图 | 结果图"""
-        row = ctk.CTkFrame(parent, fg_color=C["bg"])
-        row.pack(fill="both", expand=True)
-
-        self._preview_labels = {}
-        self._preview_cards = {}
-
+        # 三联对比（水平排列）
         panels = [
-            ("参考图  Reference", "ref"),
-            ("原图  Source", "src"),
-            ("结果图  Result", "result"),
+            ("参考图", "ref", "点击上传参考图", self.load_reference, False),
+            ("原图", "src", "点击上传原图", self.load_targets, False),
+            ("结果图", "result", "等待追色", None, True),
         ]
 
-        for title, key in panels:
-            card = ctk.CTkFrame(
-                row, fg_color=C["card"], corner_radius=8,
-                border_width=1, border_color=C["border"]
-            )
-            card.pack(side="left", fill="both", expand=True, padx=5, pady=4)
-            self._preview_cards[key] = card
+        panels_frame = tk.Frame(preview_container, bg=self.BG_CARD)
+        panels_frame.pack(fill="both", expand=True, padx=14, pady=14)
 
-            ctk.CTkLabel(
-                card, text=title,
-                font=ctk.CTkFont(family="PingFang SC", size=11, weight="bold"),
-                text_color=C["text"]
-            ).pack(pady=(8, 2))
+        for title, key, placeholder, cmd, is_result in panels:
+            self._make_preview_card(panels_frame, title, key, placeholder, cmd, is_result)
 
-            # 预览区
-            preview = ctk.CTkLabel(
-                card, text="", fg_color="#0f0f17",
-                width=self.PREVIEW_W, height=self.PREVIEW_H,
-                font=ctk.CTkFont(family="PingFang SC", size=10),
-                text_color=C["overlay"], corner_radius=4
-            )
-            preview.pack(padx=8, pady=(0, 6), fill="both", expand=True)
-            self._preview_labels[key] = preview
+        # 底部指标条
+        metrics_frame = tk.Frame(parent, bg=self.BG_DARK)
+        metrics_frame.pack(fill="x", side="bottom")
 
-            if key == "ref":
-                preview.bind("<Button-1>", lambda e: self._load_ref())
-                self._set_placeholder(key, "点击导入参考图")
-            elif key == "src":
-                preview.bind("<Button-1>", lambda e: self._load_src())
-                self._set_placeholder(key, "点击导入原图")
+        metrics = [
+            ("色差 ΔE", self.metric_delta_e, ""),
+            ("肤色偏差", self.metric_skin, "安全"),
+            ("处理速度", self.metric_speed, "—"),
+            ("覆盖度", self.metric_coverage, "—"),
+        ]
+        for label_text, var, default in metrics:
+            card = tk.Frame(metrics_frame, bg=self.BG_CARD)
+            card.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            tk.Label(card, text=label_text, font=("PingFang SC", 10),
+                     bg=self.BG_CARD, fg=self.TEXT_MUTE).pack(padx=12, pady=(8, 0))
+            val_label = tk.Label(card, text=default, font=("PingFang SC", 13, "bold"),
+                                 bg=self.BG_CARD, fg=self.TEXT_MAIN)
+            val_label.pack(padx=12, pady=(2, 8))
+            if var != self.metric_delta_e:
+                var.set(default)
+
+    def _make_preview_card(self, parent, title: str, key: str,
+                           placeholder: str, cmd, is_result: bool):
+        """创建单个预览卡片"""
+        card = tk.Frame(parent, bg=self.BG_INPUT, bd=0)
+        card.pack(side="left", fill="both", expand=True, padx=6)
+
+        # 标题行
+        title_frame = tk.Frame(card, bg=self.BG_INPUT)
+        title_frame.pack(fill="x", padx=10, pady=(10, 6))
+
+        tk.Label(title_frame, text=title, font=("PingFang SC", 11),
+                 bg=self.BG_INPUT, fg=self.TEXT_MUTE).pack(side="left")
+
+        status_text = "点击上传" if not is_result else "等待追色"
+        status_color = self.ACCENT if not is_result else self.ORANGE
+        status = tk.Label(title_frame, text=status_text, font=("PingFang SC", 10),
+                          bg=self.BG_INPUT, fg=status_color, cursor="hand2" if cmd else "")
+        status.pack(side="right")
+
+        # 预览区域（16:9比例容器）
+        canvas_h = 280 if not is_result else 280
+        canvas = tk.Label(card, bg=self.BG_DARK, cursor="hand2" if cmd else "")
+        canvas.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        canvas.config(width=400, height=canvas_h)
+        self._make_placeholder(canvas, placeholder)
+        self.preview_labels[key] = canvas
+
+        if cmd:
+            canvas.bind("<Button-1>", lambda e, c=cmd: c())
+
+        # 结果图底部标签
+        if is_result:
+            result_tag = tk.Label(card, text="原图", font=("PingFang SC", 9),
+                                  bg="rgba(0,0,0,0.5)", fg=self.TEXT_MAIN)
+            result_tag.place(relx=0.98, rely=0.98, anchor="se", x=-12, y=-12)
+            self.result_tag = result_tag
+
+    def _build_tools(self, parent):
+        """右侧工具栏"""
+        container = tk.Frame(parent, bg=self.BG_DARK)
+        container.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # 预设选择
+        self._build_preset_section(container)
+
+        # 核心参数
+        self._build_param_section(container)
+
+        # 肤色保护
+        self._build_skin_section(container)
+
+        # 开始追色（主按钮）
+        self._build_start_button(container)
+
+        # 导出选项
+        self._build_export_section(container)
+
+    def _build_preset_section(self, parent):
+        """预设选择区"""
+        frame = tk.Frame(parent, bg=self.BG_CARD)
+        frame.pack(fill="x", pady=(0, 8))
+
+        # 标题
+        header = tk.Frame(frame, bg=self.BG_CARD)
+        header.pack(fill="x", padx=12, pady=(10, 6))
+        tk.Label(header, text="预设", font=("PingFang SC", 12, "bold"),
+                 bg=self.BG_CARD, fg=self.TEXT_MAIN).pack(side="left")
+        tk.Label(header, text="+ 新建", font=("PingFang SC", 10),
+                 bg=self.BG_CARD, fg=self.TEXT_MUTE, cursor="hand2").pack(side="right")
+
+        # 预设卡片容器（横向滚动）
+        scroll_frame = tk.Frame(frame, bg=self.BG_CARD)
+        scroll_frame.pack(fill="x", padx=12, pady=(0, 10))
+
+        self.preset_buttons = []
+        self.preset_canvas = tk.Canvas(scroll_frame, bg=self.BG_CARD,
+                                        height=56, highlightthickness=0,
+                                        xscrollcommand=lambda *a: None)
+        self.preset_scroll = tk.Frame(self.preset_canvas, bg=self.BG_CARD)
+        self.preset_window = self.preset_canvas.create_window((0, 0),
+                                                                window=self.preset_scroll, anchor="w")
+
+        def on_configure(e):
+            self.preset_canvas.configure(scrollregion=self.preset_canvas.bbox("all"))
+
+        self.preset_scroll.bind("<Configure>", on_configure)
+        self.preset_canvas.pack(fill="x")
+        self.preset_canvas.bind("<MouseWheel>", lambda e: self.preset_canvas.xview_scroll(
+            int(-1 * (e.delta / 120)), "units"))
+
+        self._render_preset_cards()
+
+    def _render_preset_cards(self):
+        """渲染预设卡片"""
+        for widget in self.preset_scroll.winfo_children():
+            widget.destroy()
+        self.preset_buttons = []
+
+        for preset in self.presets:
+            colors = preset.get("preview_colors", ["#333", "#444"])
+            card = tk.Frame(self.preset_scroll, bg=self.BG_CARD, cursor="hand2", height=50)
+            card.pack(side="left", fill="y", padx=(0, 6))
+
+            # 颜色预览块
+            preview = tk.Frame(card, bg=colors[0], width=60, height=36)
+            preview.pack(pady=(0, 4))
+            preview.pack_propagate(False)
+
+            # 预设名称
+            name = tk.Label(card, text=preset["name"][:4], font=("PingFang SC", 9),
+                           bg=self.BG_CARD, fg=self.TEXT_MUTE)
+            name.pack()
+
+            # 绑定点击
+            def on_click(p=preset, c=card):
+                self._select_preset(p, c)
+
+            for widget in [card, preview, name]:
+                widget.bind("<Button-1>", lambda e, pc=preset, cc=card: self._select_preset(pc, cc))
+
+        # 更新滚动区域
+        self.preset_scroll.update_idletasks()
+        self.preset_canvas.configure(scrollregion=self.preset_canvas.bbox("all"))
+
+    def _select_preset(self, preset: Dict, card: tk.Frame):
+        """选择预设"""
+        # 重置所有卡片边框
+        for btn in self.preset_buttons:
+            try:
+                btn.config(bg=self.BG_CARD, highlightbackground=self.BG_CARD)
+            except:
+                pass
+
+        # 高亮选中卡片
+        card.config(highlightbackground=self.ACCENT, highlightthickness=2)
+        self.selected_preset = preset
+
+        # 应用预设参数到滑块
+        params = preset.get("params", {})
+        if "exposure" in params:
+            self.tone_strength.set(max(0, min(1.5, params.get("exposure", 0) / 2 + 0.8)))
+        if "contrast" in params:
+            self.color_strength.set(max(0, min(1.5, params.get("contrast", 0) / 50 + 0.9)))
+
+        self.status_var.set(f"已选择预设：{preset['name']}（{preset.get('scene', '')}）")
+
+    def _build_param_section(self, parent):
+        """核心参数区"""
+        frame = tk.Frame(parent, bg=self.BG_CARD)
+        frame.pack(fill="x", pady=(0, 8))
+
+        tk.Label(frame, text="参数", font=("PingFang SC", 12, "bold"),
+                 bg=self.BG_CARD, fg=self.TEXT_MAIN).pack(anchor="w", padx=12, pady=(10, 8))
+
+        sliders = [
+            ("曝光", self.tone_strength, -1.0, 2.0, "{:+.1f}"),
+            ("对比度", self.color_strength, -50, 50, "{:+.0f}"),
+            ("饱和度", tk.DoubleVar(value=0), -100, 100, "{:+.0f}"),
+            ("色调", tk.DoubleVar(value=0), -100, 100, "{:+.0f}"),
+        ]
+
+        self.slider_vars = {}
+        for label, var, from_, to, fmt in sliders:
+            row = tk.Frame(frame, bg=self.BG_CARD)
+            row.pack(fill="x", padx=12, pady=2)
+
+            top_row = tk.Frame(row, bg=self.BG_CARD)
+            top_row.pack(fill="x")
+
+            tk.Label(top_row, text=label, font=("PingFang SC", 10),
+                     bg=self.BG_CARD, fg=self.TEXT_MUTE).pack(side="left")
+
+            default_val = var.get()
+            val_lbl = tk.Label(top_row, text=fmt.format(default_val),
+                               font=("PingFang SC", 10, "bold"),
+                               bg=self.BG_CARD, fg=self.TEXT_MAIN, width=5)
+            val_lbl.pack(side="right")
+
+            s = ttk.Scale(row, from_=from_, to=to, variable=var,
+                           orient="horizontal", length=280)
+            s.pack(fill="x", pady=(0, 6))
+
+            # 变量引用
+            self.slider_vars[label] = (var, val_lbl, fmt)
+
+    def _build_skin_section(self, parent):
+        """肤色保护区"""
+        frame = tk.Frame(parent, bg=self.BG_CARD)
+        frame.pack(fill="x", pady=(0, 8))
+
+        # 标题行
+        header = tk.Frame(frame, bg=self.BG_CARD)
+        header.pack(fill="x", padx=12, pady=(10, 6))
+        tk.Label(header, text="肤色保护", font=("PingFang SC", 12, "bold"),
+                 bg=self.BG_CARD, fg=self.TEXT_MAIN).pack(side="left")
+
+        # 开关
+        switch = tk.Frame(header, bg=self.BG_CARD, cursor="hand2")
+        switch.pack(side="right")
+
+        def toggle_skin():
+            val = not self.skin_protection.get()
+            self.skin_protection.set(val)
+            bg = self.GREEN if val else self.TEXT_MUTE
+            knob.place(x=20 if val else 2, rely=0.5, anchor="center")
+
+        bg_track = tk.Frame(switch, bg=self.TEXT_MUTE, width=38, height=22, bd=0)
+        bg_track.pack()
+        bg_track.pack_propagate(False)
+        knob = tk.Frame(bg_track, bg=self.TEXT_MAIN, width=18, height=18, bd=0)
+        knob.place(x=2, rely=0.5, anchor="center")
+        switch.bind("<Button-1>", lambda e: toggle_skin())
+
+        # 状态卡片
+        status_row = tk.Frame(frame, bg=self.BG_CARD)
+        status_row.pack(fill="x", padx=12, pady=(0, 8))
+
+        for label_text in ["色差", "状态"]:
+            stat = tk.Frame(status_row, bg=self.BG_INPUT)
+            stat.pack(side="left", fill="x", expand=True, padx=(0, 4))
+            tk.Label(stat, text=self.metric_delta_e.get() if label_text == "色差" else "安全",
+                     font=("PingFang SC", 11, "bold"), bg=self.BG_INPUT,
+                     fg=self.GREEN).pack(pady=6)
+            tk.Label(stat, text=label_text, font=("PingFang SC", 9),
+                     bg=self.BG_INPUT, fg=self.TEXT_MUTE).pack(pady=(0, 6))
+
+    def _build_start_button(self, parent):
+        """开始追色主按钮"""
+        frame = tk.Frame(parent, bg=self.BG_CARD)
+        frame.pack(fill="x", pady=(0, 8))
+
+        # 主按钮
+        btn = tk.Frame(frame, bg=self.ORANGE, cursor="hand2")
+        btn.pack(fill="x", padx=12, pady=12)
+
+        def on_enter(e): btn.config(bg="#d97706")
+        def on_leave(e): btn.config(bg=self.ORANGE)
+
+        btn.bind("<Enter>", on_enter)
+        btn.bind("<Leave>", on_leave)
+
+        btn_inner = tk.Frame(btn, bg=self.ORANGE)
+        btn_inner.pack(fill="x", ipady=8)
+        btn_inner.bind("<Button-1>", lambda e: self.start_color_transfer())
+
+        # 播放图标（三角形）
+        icon_canvas = tk.Canvas(btn_inner, width=24, height=24, bg=self.ORANGE, bd=0, highlightthickness=0)
+        icon_canvas.pack(side="left", padx=(12, 8))
+        icon_canvas.create_polygon(7, 5, 7, 19, 19, 12, fill=self.TEXT_MAIN, outline="")
+
+        tk.Label(btn_inner, text="开始追色", font=("PingFang SC", 13, "bold"),
+                 bg=self.ORANGE, fg=self.TEXT_MAIN).pack(side="left")
+
+        # 快捷键提示
+        tk.Label(frame, text="快捷键: ⌘ + Enter", font=("PingFang SC", 9),
+                 bg=self.BG_CARD, fg=self.TEXT_MUTE).pack(pady=(0, 12))
+
+        # 保存引用
+        self.start_btn = btn
+
+    def _build_export_section(self, parent):
+        """导出选项"""
+        frame = tk.Frame(parent, bg=self.BG_CARD)
+        frame.pack(fill="x")
+
+        tk.Label(frame, text="导出", font=("PingFang SC", 12, "bold"),
+                 bg=self.BG_CARD, fg=self.TEXT_MAIN).pack(anchor="w", padx=12, pady=(10, 8))
+
+        btn_row = tk.Frame(frame, bg=self.BG_CARD)
+        btn_row.pack(fill="x", padx=12, pady=(0, 10))
+
+        for label, cmd, is_primary in [
+            ("图片", self.save_result, True),
+            ("LUT", self.export_lut, False),
+        ]:
+            bg = self.ACCENT if is_primary else self.BG_INPUT
+            fg = self.TEXT_MAIN if is_primary else self.TEXT_MUTE
+            b = tk.Button(btn_row, text=label, command=cmd, bg=bg, fg=fg,
+                          font=("PingFang SC", 11), bd=0, padx=10, pady=7,
+                          cursor="hand2")
+            b.pack(side="left", fill="x", expand=True, padx=(0, 6))
+            if is_primary:
+                def on_enter(e, b=b): b.config(bg=self.BTN_HOVER)
+                def on_leave(e, b=b): b.config(bg=self.ACCENT)
             else:
-                self._set_placeholder(key, "追色结果将显示在这里")
-
-        # 按钮行
-        btn_row = ctk.CTkFrame(parent, fg_color=C["bg"])
-        btn_row.pack(fill="x", padx=5, pady=(0, 6))
-
-        ctk.CTkButton(
-            btn_row, text="↓ 保存结果图", command=self._save_result,
-            fg_color=C["green"], hover_color="#8dd88a", text_color="#1e1e2e",
-            font=ctk.CTkFont(family="PingFang SC", size=11, weight="bold"),
-            width=140, corner_radius=6
-        ).pack(side="right", padx=5)
-
-        ctk.CTkButton(
-            btn_row, text="↓ 导出 .cube LUT", command=self._export_lut,
-            fg_color=C["blue"], hover_color="#7aa8e8", text_color="#1e1e2e",
-            font=ctk.CTkFont(family="PingFang SC", size=11, weight="bold"),
-            width=160, corner_radius=6
-        ).pack(side="right", padx=5)
-
-        # 评价指标
-        self._eval_label = ctk.CTkLabel(
-            parent, text="", font=ctk.CTkFont(family="PingFang SC", size=10),
-            text_color=C["subtext"], anchor="w"
-        )
-        self._eval_label.pack(fill="x", padx=5, pady=(0, 4))
-
-    # ── 参数控制区 ──
-
-    def _build_control_panel(self, parent):
-        """右侧标签页参数面板"""
-        self._tabview = ctk.CTkTabview(parent, fg_color=C["bg"], corner_radius=8,
-                                        segmented_button_fg_color=C["surface"],
-                                        segmented_button_selected_color=C["accent"],
-                                        segmented_button_unselected_color=C["surface"])
-        self._tabview.pack(fill="both", expand=True)
-
-        # 三个标签页
-        tab_basic = self._tabview.add("基础")
-        tab_expert = self._tabview.add("进阶")
-        tab_style = self._tabview.add("风格")
-
-        self._build_basic_tab(tab_basic)
-        self._build_expert_tab(tab_expert)
-        self._build_style_tab(tab_style)
-
-    def _build_basic_tab(self, tab):
-        """基础参数: 影调/色调强度 + 肤色保护"""
-        self._section(tab, "⚙  追色参数")
-
-        self._tone_var = ctk.DoubleVar(value=0.8)
-        self._color_var = ctk.DoubleVar(value=0.9)
-        self._slider_row(tab, "影调强度  Tone", self._tone_var, 0, 1.0)
-        self._slider_row(tab, "色调强度  Color", self._color_var, 0, 1.0)
-
-        self._section(tab, "👤  肤色保护")
-        self._skin_on_var = ctk.BooleanVar(value=True)
-        self._skin_var = ctk.DoubleVar(value=0.85)
-        ctk.CTkCheckBox(
-            tab, text="启用肤色保护", variable=self._skin_on_var,
-            font=ctk.CTkFont(family="PingFang SC", size=11),
-            text_color=C["text"], fg_color=C["accent"], hover_color=C["accent2"],
-            command=self._on_param_change
-        ).pack(anchor="w", pady=2)
-        self._slider_row(tab, "保护强度  Protect", self._skin_var, 0, 1.0)
-
-        ctk.CTkLabel(
-            tab, text="检测肤色区域，匹配色调时保留\n人物皮肤原色（HSV+Lab双空间检测）",
-            font=ctk.CTkFont(family="PingFang SC", size=9),
-            text_color=C["subtext"], justify="left"
-        ).pack(anchor="w", pady=(0, 4))
-
-        # 全局强度
-        self._section(tab, "🎚  全局强度")
-        self._strength_var = ctk.DoubleVar(value=1.0)
-        self._slider_row(tab, "强度  Strength", self._strength_var, 0, 1.0)
-
-        # 操作按钮
-        ctk.CTkFrame(tab, fg_color=C["border"], height=1).pack(fill="x", pady=10)
-        ctk.CTkButton(
-            tab, text="▶  开始追色", command=self._run_transfer,
-            fg_color=C["accent"], hover_color=C["accent2"], text_color="#1e1e2e",
-            font=ctk.CTkFont(family="PingFang SC", size=14, weight="bold"),
-            height=40, corner_radius=8
-        ).pack(fill="x", pady=3)
-
-        ctk.CTkButton(
-            tab, text="重置参数", command=self._reset_params,
-            fg_color=C["surface"], hover_color=C["overlay"], text_color=C["text"],
-            font=ctk.CTkFont(family="PingFang SC", size=11),
-            corner_radius=6
-        ).pack(fill="x", pady=2)
-
-    def _build_expert_tab(self, tab):
-        """进阶参数: Lightroom 风格面板"""
-        # ── 影调 ──
-        self._section(tab, "📐  影调 (基础面板)")
-        self._exposure_var = ctk.DoubleVar(value=0.0)
-        self._contrast_var = ctk.DoubleVar(value=0.0)
-        self._highlights_var = ctk.DoubleVar(value=0.0)
-        self._shadows_var = ctk.DoubleVar(value=0.0)
-        self._whites_var = ctk.DoubleVar(value=0.0)
-        self._blacks_var = ctk.DoubleVar(value=0.0)
-        self._slider_row(tab, "曝光  Exposure", self._exposure_var, -3.0, 3.0, fmt="{:+.2f} EV")
-        self._slider_row(tab, "对比度  Contrast", self._contrast_var, -100, 100, fmt="{:+.0f}")
-        self._slider_row(tab, "高光  Highlights", self._highlights_var, -100, 100, fmt="{:+.0f}")
-        self._slider_row(tab, "阴影  Shadows", self._shadows_var, -100, 100, fmt="{:+.0f}")
-        self._slider_row(tab, "白色  Whites", self._whites_var, -100, 100, fmt="{:+.0f}")
-        self._slider_row(tab, "黑色  Blacks", self._blacks_var, -100, 100, fmt="{:+.0f}")
-
-        # ── 分离色调 ──
-        self._section(tab, "🎨  分离色调")
-        self._hi_hue_var = ctk.DoubleVar(value=0.0)
-        self._hi_sat_var = ctk.DoubleVar(value=0.0)
-        self._sh_hue_var = ctk.DoubleVar(value=0.0)
-        self._sh_sat_var = ctk.DoubleVar(value=0.0)
-        self._slider_row(tab, "高光色相  Hi-Hue", self._hi_hue_var, 0, 360, fmt="{:.0f}°")
-        self._slider_row(tab, "高光饱和  Hi-Sat", self._hi_sat_var, 0, 100, fmt="{:.0f}")
-        self._slider_row(tab, "阴影色相  Sh-Hue", self._sh_hue_var, 0, 360, fmt="{:.0f}°")
-        self._slider_row(tab, "阴影饱和  Sh-Sat", self._sh_sat_var, 0, 100, fmt="{:.0f}")
-
-        # ── 白平衡 ──
-        self._section(tab, "🌡  白平衡校准")
-        self._temp_var = ctk.DoubleVar(value=0.0)
-        self._tint_var = ctk.DoubleVar(value=0.0)
-        self._slider_row(tab, "色温  Temp", self._temp_var, -100, 100, fmt="{:+.0f}")
-        self._slider_row(tab, "色调  Tint", self._tint_var, -100, 100, fmt="{:+.0f}")
-
-        # ── 自动分析按钮 ──
-        ctk.CTkFrame(tab, fg_color=C["border"], height=1).pack(fill="x", pady=8)
-        ctk.CTkButton(
-            tab, text="🔍 自动分析差异", command=self._auto_analyze,
-            fg_color=C["blue"], hover_color="#7aa8e8", text_color="#1e1e2e",
-            font=ctk.CTkFont(family="PingFang SC", size=11, weight="bold"),
-            corner_radius=6
-        ).pack(fill="x", pady=2)
-
-    def _build_style_tab(self, tab):
-        """风格预设"""
-        self._section(tab, "🎬  内置风格预设")
-
-        preset_info = {
-            "日系清新": ("🌿 滨田英明风格：高亮度低对比，微冷偏青白", C["green"]),
-            "暗调电影": ("🎬 低调高反差，冷蓝暗调", C["blue"]),
-            "复古胶片": ("📷 提黑场复古感，高光偏橙阴影偏绿", C["yellow"]),
-            "青橙色调": ("🎭 电影级青橙对比色调", C["peach"]),
-            "Kodak Portra": ("🎞 经典人像胶片色调，肤色通透", C["accent"]),
-        }
-
-        for name, (desc, color) in preset_info.items():
-            frame = ctk.CTkFrame(tab, fg_color=C["card"], corner_radius=6,
-                                  border_width=1, border_color=C["border"])
-            frame.pack(fill="x", pady=3, padx=4)
-
-            ctk.CTkLabel(
-                frame, text=name,
-                font=ctk.CTkFont(family="PingFang SC", size=12, weight="bold"),
-                text_color=color, anchor="w"
-            ).pack(fill="x", padx=10, pady=(8, 0))
-
-            ctk.CTkLabel(
-                frame, text=desc,
-                font=ctk.CTkFont(family="PingFang SC", size=10),
-                text_color=C["subtext"], anchor="w"
-            ).pack(fill="x", padx=10, pady=(2, 4))
-
-            ctk.CTkButton(
-                frame, text="应用", width=60, height=28,
-                command=lambda n=name: self._apply_preset(n),
-                fg_color=color, hover_color=C["overlay"], text_color="#1e1e2e",
-                font=ctk.CTkFont(family="PingFang SC", size=10, weight="bold"),
-                corner_radius=4
-            ).pack(anchor="e", padx=10, pady=(0, 8))
-
-        # ── 参考图特征显示 ──
-        self._section(tab, "📊  参考图特征")
-        self._ref_info_label = ctk.CTkLabel(
-            tab, text="未加载参考图",
-            font=ctk.CTkFont(family="PingFang SC", size=10),
-            text_color=C["subtext"], justify="left", anchor="w"
-        )
-        self._ref_info_label.pack(fill="x", padx=4, pady=2)
+                def on_enter(e, b=b): b.config(bg=self.BORDER)
+                def on_leave(e, b=b): b.config(bg=self.BG_INPUT)
+            b.bind("<Enter>", on_enter)
+            b.bind("<Leave>", on_leave)
 
     # ──────────────────────────────────────────
-    #  UI 辅助方法
+    #  辅助方法
     # ──────────────────────────────────────────
 
-    def _section(self, parent, text):
-        f = ctk.CTkFrame(parent, fg_color="transparent")
-        f.pack(fill="x", pady=(12, 2))
-        ctk.CTkLabel(
-            f, text=text,
-            font=ctk.CTkFont(family="PingFang SC", size=12, weight="bold"),
-            text_color=C["accent"]
-        ).pack(anchor="w")
+    def _make_placeholder(self, label, text):
+        """显示占位符"""
+        label.config(image="", text=text, fg=self.TEXT_HINT,
+                     font=("PingFang SC", 11), compound="center")
+        label.image = None
 
-    def _slider_row(self, parent, label, var, from_, to, fmt="{:.0%}"):
-        f = ctk.CTkFrame(parent, fg_color="transparent")
-        f.pack(fill="x", pady=2)
+    def _show_preview(self, key: str, arr: np.ndarray, max_h: int = 280):
+        """显示预览图"""
+        img_u8 = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
+        pil_img = Image.fromarray(img_u8, mode='RGB')
 
-        top = ctk.CTkFrame(f, fg_color="transparent")
-        top.pack(fill="x")
-        ctk.CTkLabel(
-            top, text=label,
-            font=ctk.CTkFont(family="PingFang SC", size=10),
-            text_color=C["text"]
-        ).pack(side="left")
-        val_lbl = ctk.CTkLabel(
-            top, text=fmt.format(var.get()),
-            font=ctk.CTkFont(family="PingFang SC", size=10, weight="bold"),
-            text_color=C["accent"], width=60
-        )
-        val_lbl.pack(side="right")
+        w, h = pil_img.size
+        target_h = max_h
+        scale = target_h / h if h > target_h else 1.0
+        if scale < 1.0:
+            pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
 
-        slider = ctk.CTkSlider(
-            f, from_=from_, to=to, variable=var,
-            command=lambda v, l=val_lbl, fm=fmt, va=var: (
-                l.configure(text=fm.format(va.get())),
-                self._on_param_change()
-            ),
-            button_color=C["accent"], button_hover_color=C["accent2"],
-            progress_color=C["accent"], fg_color=C["surface"],
-            height=16
-        )
-        slider.pack(fill="x", pady=(2, 0))
+        canvas_w = self.preview_labels[key].winfo_width() or 400
+        canvas_h = self.preview_labels[key].winfo_height() or max_h
+        canvas = Image.new("RGB", (canvas_w, canvas_h), "#0a0a0b")
+        x = (canvas_w - pil_img.width) // 2
+        y = (canvas_h - pil_img.height) // 2
+        canvas.paste(pil_img, (x, y))
 
-    def _set_placeholder(self, key, text):
-        lbl = self._preview_labels[key]
-        lbl.configure(text=text, image=None)
-        lbl._ctk_img = None
+        tk_img = ImageTk.PhotoImage(canvas)
+        lbl = self.preview_labels[key]
+        lbl.config(image=tk_img, text="", compound="center")
+        lbl.image = tk_img
 
-    def _show_preview(self, key, arr):
-        ctk_img = np_to_ctk_image(arr, self.PREVIEW_W, self.PREVIEW_H)
-        lbl = self._preview_labels[key]
-        lbl.configure(image=ctk_img, text="")
-        lbl._ctk_img = ctk_img  # 防止 GC
+    def _show_preview_raw(self, key: str, pil_img: Image.Image):
+        """直接显示PIL图片"""
+        canvas_w = self.preview_labels[key].winfo_width() or 400
+        canvas_h = self.preview_labels[key].winfo_height() or 280
 
-    def _set_status(self, msg):
-        self._status_var.set(msg)
+        w, h = pil_img.size
+        scale = min(canvas_w / w, canvas_h / h, 1.0)
+        if scale < 1.0:
+            pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+
+        canvas = Image.new("RGB", (canvas_w, canvas_h), "#0a0a0b")
+        x = (canvas_w - pil_img.width) // 2
+        y = (canvas_h - pil_img.height) // 2
+        canvas.paste(pil_img, (x, y))
+
+        tk_img = ImageTk.PhotoImage(canvas)
+        lbl = self.preview_labels[key]
+        lbl.config(image=tk_img, text="", compound="center")
+        lbl.image = tk_img
 
     # ──────────────────────────────────────────
     #  图片加载
     # ──────────────────────────────────────────
 
-    def _load_ref(self):
-        path = filedialog.askopenfilename(
+    def load_reference(self):
+        """加载参考图"""
+        filepath = filedialog.askopenfilename(
             title="选择参考图",
-            filetypes=[("图片文件", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"), ("所有文件", "*.*")]
+            filetypes=[("图片文件", "*.jpg *.jpeg *.png *.bmp *.tiff"), ("所有文件", "*.*")]
         )
-        if not path:
+        if not filepath:
             return
         try:
-            self.ref_img_np = load_image(path)
-            self.engine.load_reference(self.ref_img_np)
-            self._show_preview("ref", self.ref_img_np)
-            self.ref_path = os.path.basename(path)
-            self._set_status(f"✓ 参考图已加载：{self.ref_path}  |  已分析色彩特征")
-            self._update_ref_info()
-            if self.src_img_np is not None:
-                self._run_transfer_async()
-        except Exception as e:
-            messagebox.showerror("错误", f"加载参考图失败：{e}")
+            img = load_image(filepath)
+            self.reference_path = filepath
+            self.reference_img = img
+            self._show_preview("ref", img)
 
-    def _load_src(self):
-        path = filedialog.askopenfilename(
+            if self.mode.get() == "pro":
+                self.ref_features = self.feature_extractor.extract(img)
+                self.status_var.set(f"✓ 参考图已加载（专业模式）— {os.path.basename(filepath)}")
+            else:
+                self.status_var.set(f"✓ 参考图已加载（快速模式）— {os.path.basename(filepath)}")
+
+            if self.target_imgs and self.auto_preview.get():
+                self._run_transfer_async()
+
+        except Exception as e:
+            import traceback
+            messagebox.showerror("错误", f"加载失败: {str(e)}\n{traceback.format_exc()}")
+
+    def load_targets(self):
+        """加载目标图"""
+        filepaths = filedialog.askopenfilenames(
             title="选择原图",
-            filetypes=[("图片文件", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"), ("所有文件", "*.*")]
+            filetypes=[("图片文件", "*.jpg *.jpeg *.png *.bmp *.tiff"), ("所有文件", "*.*")]
         )
-        if not path:
-            return
-        try:
-            self.src_img_np = load_image(path)
-            self._show_preview("src", self.src_img_np)
-            self.src_path = os.path.basename(path)
-            self._set_status(f"✓ 原图已加载：{self.src_path}")
-            if self.ref_img_np is not None:
-                self._run_transfer_async()
-        except Exception as e:
-            messagebox.showerror("错误", f"加载原图失败：{e}")
+        if filepaths:
+            self._load_batch(filepaths)
 
-    def _update_ref_info(self):
-        """更新参考图特征显示"""
-        feat_dict = self.engine.get_ref_features_dict()
-        if not feat_dict:
-            return
-        lab = feat_dict.get("lab", {})
-        skin = feat_dict.get("skin", {})
-        tone = feat_dict.get("tone", {})
-        info = (
-            f"Lab: L={lab.get('mean_L', '?'):.1f} a={lab.get('mean_a', '?'):.1f} b={lab.get('mean_b', '?'):.1f}\n"
-            f"影调: p50={tone.get('p50', '?'):.1f} std={tone.get('std', '?'):.1f}\n"
-            f"肤色: {'✓ 检测到' if skin.get('detected') else '✗ 未检测到'}"
-            f" ({skin.get('mask_ratio', 0):.1%})"
-        )
-        self._ref_info_label.configure(text=info)
+    def load_batch(self):
+        """批量导入"""
+        dirpath = filedialog.askdirectory(title="选择文件夹")
+        if dirpath:
+            exts = ["jpg", "jpeg", "png", "bmp", "tiff"]
+            filepaths = []
+            for ext in exts:
+                filepaths.extend(Path(dirpath).glob(f"*.{ext}"))
+                filepaths.extend(Path(dirpath).glob(f"*.{ext.upper()}"))
+            if filepaths:
+                self._load_batch([str(f) for f in filepaths])
+
+    def _load_batch(self, filepaths):
+        """处理批量文件"""
+        self.target_imgs = []
+        for fp in filepaths:
+            try:
+                img = load_image(fp)
+                self.target_imgs.append((fp, img))
+            except:
+                pass
+
+        if self.target_imgs:
+            self.current_index = 0
+            self._update_target_preview()
+            count = len(self.target_imgs)
+            # 更新图片信息
+            if self.target_imgs:
+                _, img = self.target_imgs[self.current_index]
+                h, w = img.shape[:2]
+                self.img_info_label.config(text=f"图像: {w}×{h}")
+
+            self.status_var.set(f"已加载 {count} 张图片 — 点击「开始追色」")
+
+    def _update_target_preview(self):
+        """更新目标图预览"""
+        if self.target_imgs:
+            _, img = self.target_imgs[self.current_index]
+            self._show_preview("src", img)
+            if self.img_info_label:
+                h, w = img.shape[:2]
+                self.img_info_label.config(text=f"图像: {w}×{h}")
+        else:
+            self._make_placeholder(self.preview_labels.get("src", tk.Label()), "点击上传原图")
+            self.img_info_label.config(text="")
+
+    def prev_image(self):
+        """上一张"""
+        if self.target_imgs and self.current_index > 0:
+            self.current_index -= 1
+            self._update_target_preview()
+            self._make_placeholder(self.preview_labels.get("result", tk.Label()), "等待追色")
+            self.current_result = None
+
+    def next_image(self):
+        """下一张"""
+        if self.target_imgs and self.current_index < len(self.target_imgs) - 1:
+            self.current_index += 1
+            self._update_target_preview()
+            self._make_placeholder(self.preview_labels.get("result", tk.Label()), "等待追色")
+            self.current_result = None
+
+    def browse_output(self):
+        """选择输出目录"""
+        dirpath = filedialog.askdirectory(title="选择输出目录")
+        if dirpath:
+            self.output_dir = dirpath
 
     # ──────────────────────────────────────────
-    #  追色执行
+    #  追色处理
     # ──────────────────────────────────────────
 
-    def _on_mode_change(self, value):
-        """模式切换回调"""
-        self._set_status(f"切换至{'简化' if value == '简化' else '专家'}模式")
-
-    def _on_param_change(self):
-        """参数变化回调 (可扩展为自动预览)"""
-        pass
-
-    def _get_mode(self):
-        return "simple" if self._mode_var.get() == "简化" else "expert"
-
-    def _check_ready(self):
-        if self.ref_img_np is None:
+    def start_color_transfer(self):
+        """开始追色"""
+        if self.reference_img is None:
             messagebox.showwarning("提示", "请先导入参考图")
-            return False
-        if self.src_img_np is None:
-            messagebox.showwarning("提示", "请先导入原图")
-            return False
-        return True
-
-    def _run_transfer(self):
-        if not self._check_ready():
             return
+        if not self.target_imgs:
+            messagebox.showwarning("提示", "请先导入原图")
+            return
+
         self._run_transfer_async()
 
     def _run_transfer_async(self):
-        if self._processing:
-            return
-        if self.ref_img_np is None or self.src_img_np is None:
-            return
+        """异步执行追色"""
+        thread = threading.Thread(target=self._color_transfer_thread, daemon=True)
+        thread.start()
 
-        self._processing = True
-        mode = self._get_mode()
-        src_copy = self.src_img_np.copy()
-
-        # 提前读取参数
-        if mode == "simple":
-            params = {
-                "mode": "simple",
-                "tone_strength": self._tone_var.get(),
-                "color_strength": self._color_var.get(),
-                "skin_protect": self._skin_var.get(),
-                "use_skin_protect": self._skin_on_var.get(),
-                "strength": self._strength_var.get(),
-            }
-        else:
-            # 构建专家参数
-            grading = ColorGradingParams(
-                tone=ToneParams(
-                    exposure=self._exposure_var.get(),
-                    contrast=self._contrast_var.get(),
-                    highlights=self._highlights_var.get(),
-                    shadows=self._shadows_var.get(),
-                    whites=self._whites_var.get(),
-                    blacks=self._blacks_var.get(),
-                ),
-                strength=self._strength_var.get(),
-            )
-            from color_engine import SplitToneParams, CalibrationParams
-            grading.split_tone = SplitToneParams(
-                highlight_hue=self._hi_hue_var.get(),
-                highlight_sat=self._hi_sat_var.get(),
-                shadow_hue=self._sh_hue_var.get(),
-                shadow_sat=self._sh_sat_var.get(),
-            )
-            grading.calibration = CalibrationParams(
-                temp=self._temp_var.get(),
-                tint=self._tint_var.get(),
-            )
-            params = {
-                "mode": "expert",
-                "grading": grading,
-                "strength": self._strength_var.get(),
-            }
-
-        def work():
-            self.after(0, lambda: self._set_status("⏳ 追色中..."))
-            try:
-                if params["mode"] == "simple":
-                    result = self.engine.render(
-                        src_copy,
-                        mode="simple",
-                        tone_strength=params["tone_strength"],
-                        color_strength=params["color_strength"],
-                        skin_protect=params["skin_protect"],
-                        use_skin_protect=params["use_skin_protect"],
-                    )
-                else:
-                    result = self.engine.render(
-                        src_copy,
-                        mode="expert",
-                        strength=params["strength"],
-                        params=params["grading"],
-                    )
-
-                self.result_np = result
-                # 评价
-                eval_result = self.engine.evaluate(src_copy, result)
-
-                def update_ui():
-                    self._show_preview("result", result)
-                    mode_text = "简化" if params["mode"] == "simple" else "专家"
-                    self._set_status(f"✓ 追色完成 ({mode_text}模式)")
-                    if "summary" in eval_result:
-                        self._eval_label.configure(text=f"📊 {eval_result['summary']}")
-
-                self.after(0, update_ui)
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                print(f"追色异常:\n{tb}")
-                self.after(0, lambda: self._set_status(f"✗ 追色失败：{e}"))
-                self.after(0, lambda: messagebox.showerror("追色失败", f"{e}\n\n{tb}"))
-            finally:
-                self._processing = False
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _auto_analyze(self):
-        """自动分析差异并填充专家参数"""
-        if not self._check_ready():
-            return
+    def _color_transfer_thread(self):
+        """追色线程"""
+        import time
+        t0 = time.time()
 
         try:
-            from color_engine import FeatureExtractor, ColorGradingGenerator
-            extractor = FeatureExtractor()
-            generator = ColorGradingGenerator()
-            ref_feat = self.engine.ref_features
-            src_feat = extractor.extract(self.src_img_np)
-            params = generator.generate(ref_feat, src_feat, strength=self._strength_var.get())
+            progress = ProgressWindow(self.root, "追色处理中")
+            _, target_img = self.target_imgs[self.current_index]
 
-            # 填充 GUI 参数
-            self._exposure_var.set(params.tone.exposure)
-            self._contrast_var.set(params.tone.contrast)
-            self._highlights_var.set(params.tone.highlights)
-            self._shadows_var.set(params.tone.shadows)
-            self._whites_var.set(params.tone.whites)
-            self._blacks_var.set(params.tone.blacks)
-            self._hi_hue_var.set(params.split_tone.highlight_hue)
-            self._hi_sat_var.set(params.split_tone.highlight_sat)
-            self._sh_hue_var.set(params.split_tone.shadow_hue)
-            self._sh_sat_var.set(params.split_tone.shadow_sat)
-            self._temp_var.set(params.calibration.temp)
-            self._tint_var.set(params.calibration.tint)
+            if self.mode.get() == "pro" and self.ref_features is not None:
+                # 专业模式
+                progress.update_text("分析原图...", 20)
+                src_features = self.feature_extractor.extract(target_img)
 
-            # 切换到专家模式
-            self._mode_var.set("专家")
+                progress.update_text("生成追色方案...", 40)
+                params = self.grading_generator.generate(self.ref_features, src_features)
+                params = params.apply_strength(0.8)
 
-            # 显示调整理由
-            reasons = params.reasons
-            reason_text = "\n".join(f"• {v}" for v in reasons.values() if v)
-            self._set_status(f"✓ 自动分析完成，已填充参数\n{reason_text}")
+                progress.update_text("渲染调色结果...", 70)
+                result = self.color_renderer.render(target_img, params, self.ref_features)
+            else:
+                # 快速模式
+                progress.update_text("分析参考图...", 20)
+                transfer = ColorTransfer()
+                transfer.analyze(self.reference_img)
 
-            # 自动追色
-            self._run_transfer_async()
-
-        except Exception as e:
-            messagebox.showerror("分析失败", f"{e}")
-
-    def _apply_preset(self, name):
-        """应用风格预设"""
-        if not self._check_ready():
-            return
-
-        preset = BUILTIN_PRESETS.get(name)
-        if not preset:
-            return
-
-        # 填充简化参数
-        self._tone_var.set(preset.tone_strength)
-        self._color_var.set(preset.color_strength)
-        self._skin_var.set(preset.skin_protect)
-
-        # 如果有专家参数，也填充
-        if preset.expert_params:
-            ep = preset.expert_params
-            self._exposure_var.set(ep.tone.exposure)
-            self._contrast_var.set(ep.tone.contrast)
-            self._highlights_var.set(ep.tone.highlights)
-            self._shadows_var.set(ep.tone.shadows)
-            self._whites_var.set(ep.tone.whites)
-            self._blacks_var.set(ep.tone.blacks)
-            self._hi_hue_var.set(ep.split_tone.highlight_hue)
-            self._hi_sat_var.set(ep.split_tone.highlight_sat)
-            self._sh_hue_var.set(ep.split_tone.shadow_hue)
-            self._sh_sat_var.set(ep.split_tone.shadow_sat)
-            self._temp_var.set(ep.calibration.temp)
-            self._tint_var.set(ep.calibration.tint)
-
-        self._set_status(f"✓ 已应用预设：{name}")
-        self._run_transfer_async()
-
-    # ──────────────────────────────────────────
-    #  保存 / 导出
-    # ──────────────────────────────────────────
-
-    def _save_result(self):
-        if self.result_np is None:
-            messagebox.showwarning("提示", "请先执行追色")
-            return
-        path = filedialog.asksaveasfilename(
-            title="保存结果图", defaultextension=".jpg",
-            filetypes=[("JPEG", "*.jpg"), ("PNG", "*.png"), ("TIFF", "*.tif")]
-        )
-        if not path:
-            return
-        try:
-            save_image(self.result_np, path)
-            self._set_status(f"✓ 结果已保存：{os.path.basename(path)}")
-            messagebox.showinfo("保存成功", f"已保存到：\n{path}")
-        except Exception as e:
-            messagebox.showerror("错误", f"保存失败：{e}")
-
-    def _export_lut(self):
-        if self.engine.ref_features is None:
-            messagebox.showwarning("提示", "请先导入参考图以分析色彩特征")
-            return
-        path = filedialog.asksaveasfilename(
-            title="导出 .cube LUT", defaultextension=".cube",
-            filetypes=[("Cube LUT", "*.cube")]
-        )
-        if not path:
-            return
-
-        mode = self._get_mode()
-        lut_size = 33  # 默认标准精度
-
-        def work():
-            self.after(0, lambda: self._set_status("⏳ 生成 LUT 中..."))
-            try:
-                title = os.path.splitext(os.path.basename(path))[0]
-                self.engine.export_lut(
-                    output_path=path, mode=mode,
-                    tone_strength=self._tone_var.get(),
-                    color_strength=self._color_var.get(),
-                    lut_size=lut_size, title=title,
+                progress.update_text("执行色彩迁移...", 60)
+                result = transfer.transfer(
+                    target_img,
+                    tone_strength=self.tone_strength.get(),
+                    color_strength=self.color_strength.get(),
+                    skin_protect=self.skin_strength.get(),
+                    use_skin_protect=self.skin_protection.get()
                 )
-                self.after(0, lambda: self._set_status(f"✓ LUT 已导出：{os.path.basename(path)}"))
-                self.after(0, lambda: messagebox.showinfo(
-                    "导出成功",
-                    f"LUT 文件已导出：\n{path}\n\n"
-                    f"可直接导入 Premiere Pro / After Effects / DaVinci Resolve 使用。\n"
-                    f"精度：{lut_size}³"
-                ))
+
+            elapsed_ms = int((time.time() - t0) * 1000)
+            self.current_result = result
+
+            def update_ui():
+                self._show_preview("result", result)
+                # 计算评价指标
+                try:
+                    metrics = Evaluator.compute_metrics(target_img, result)
+                    self.metric_delta_e.set(str(metrics["delta_e"]))
+                    skin_text = "安全" if metrics["skin_safe"] else "注意"
+                    skin_color = self.GREEN if metrics["skin_safe"] else self.ORANGE
+                    self.metric_skin.set(skin_text)
+                    self.metric_speed.set(f"{elapsed_ms}ms")
+                    self.metric_coverage.set(f"{metrics['coverage']}%")
+                except Exception:
+                    self.metric_delta_e.set("—")
+                    self.metric_skin.set("—")
+                    self.metric_speed.set(f"{elapsed_ms}ms")
+                    self.metric_coverage.set("—")
+                # 更新结果图标签
+                if hasattr(self, "result_tag"):
+                    self.result_tag.config(text="追色完成")
+                self.status_var.set(f"✓ 追色完成（{elapsed_ms}ms）")
+
+            self.root.after(0, update_ui)
+            progress.close()
+
+        except Exception as e:
+            import traceback
+            self.root.after(0, lambda: messagebox.showerror("错误",
+                f"处理失败: {str(e)}\n{traceback.format_exc()}"))
+
+    # ──────────────────────────────────────────
+    #  导出
+    # ──────────────────────────────────────────
+
+    def export_lut(self):
+        """导出LUT"""
+        if self.reference_img is None:
+            messagebox.showwarning("提示", "请先导入参考图")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="保存LUT文件",
+            defaultextension=".cube",
+            initialdir=self.output_dir,
+            initialfile="ColorMatch_LUT",
+            filetypes=[("Cube LUT文件", "*.cube"), ("所有文件", "*.*")]
+        )
+
+        if filepath:
+            thread = threading.Thread(target=self._export_lut_thread, args=(filepath,), daemon=True)
+            thread.start()
+
+    def _export_lut_thread(self, filepath: str):
+        """LUT导出线程"""
+        try:
+            progress = ProgressWindow(self.root, "生成LUT")
+            transfer = ColorTransfer()
+            transfer.analyze(self.reference_img)
+
+            from color_engine import LUTGenerator
+            lut_val = self.lut_combo.get() if hasattr(self, "lut_combo") else "33"
+            if "17" in lut_val:
+                size = 17
+            elif "65" in lut_val:
+                size = 65
+            else:
+                size = 33
+
+            generator = LUTGenerator(lut_size=size)
+            progress.update_text("生成LUT中...", 50)
+            generator.generate(
+                transfer,
+                tone_strength=self.tone_strength.get(),
+                color_strength=self.color_strength.get(),
+                output_path=filepath,
+                title=Path(filepath).stem
+            )
+
+            self.root.after(0, lambda: self.status_var.set(f"✓ LUT已保存: {filepath}"))
+            progress.close()
+            self.root.after(0, lambda: messagebox.showinfo("成功", f"LUT已导出:\n{filepath}"))
+
+        except Exception as e:
+            import traceback
+            self.root.after(0, lambda: messagebox.showerror("错误",
+                f"导出失败: {str(e)}\n{traceback.format_exc()}"))
+
+    def save_result(self):
+        """保存结果"""
+        if self.current_result is None:
+            messagebox.showwarning("提示", "请先执行追色处理")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="保存结果",
+            defaultextension=".jpg",
+            initialdir=self.output_dir,
+            initialfile=f"ColorMatched_{self.current_index+1:03d}",
+            filetypes=[("JPEG图片", "*.jpg *.jpeg"), ("PNG图片", "*.png"), ("所有文件", "*.*")]
+        )
+
+        if filepath:
+            try:
+                save_image(self.current_result, filepath)
+                self.status_var.set(f"✓ 已保存: {filepath}")
+                messagebox.showinfo("成功", f"图片已保存:\n{filepath}")
             except Exception as e:
-                self.after(0, lambda: self._set_status(f"✗ LUT 导出失败：{e}"))
+                messagebox.showerror("错误", f"保存失败: {str(e)}")
 
-        threading.Thread(target=work, daemon=True).start()
+    def batch_process(self):
+        """批量处理"""
+        if self.reference_img is None:
+            messagebox.showwarning("提示", "请先导入参考图")
+            return
+        if not self.target_imgs:
+            messagebox.showwarning("提示", "请先导入原图")
+            return
 
-    # ──────────────────────────────────────────
-    #  其他
-    # ──────────────────────────────────────────
+        batch_dir = os.path.join(self.output_dir, "追色结果")
+        os.makedirs(batch_dir, exist_ok=True)
+
+        thread = threading.Thread(target=self._batch_process_thread, args=(batch_dir,), daemon=True)
+        thread.start()
+
+    def _batch_process_thread(self, output_dir: str):
+        """批量处理线程"""
+        try:
+            progress = ProgressWindow(self.root, "批量处理中")
+            total = len(self.target_imgs)
+
+            transfer = ColorTransfer()
+            transfer.analyze(self.reference_img)
+
+            for i, (path, target_img) in enumerate(self.target_imgs):
+                progress.update_text(f"处理第 {i+1}/{total} 张...", int((i/total)*100))
+                result = transfer.transfer(
+                    target_img,
+                    tone_strength=self.tone_strength.get(),
+                    color_strength=self.color_strength.get(),
+                    skin_protect=self.skin_strength.get(),
+                    use_skin_protect=self.skin_protection.get()
+                )
+                output_path = os.path.join(output_dir, f"ColorMatched_{i+1:03d}.jpg")
+                save_image(result, output_path)
+
+            progress.update_text("处理完成！", 100)
+            self.root.after(0, lambda: self.status_var.set(f"✓ 批量处理完成: {total} 张图片"))
+            progress.close()
+            self.root.after(0, lambda: messagebox.showinfo("完成",
+                f"批量处理完成！\n\n已处理 {total} 张图片\n保存位置: {output_dir}"))
+
+        except Exception as e:
+            import traceback
+            self.root.after(0, lambda: messagebox.showerror("错误",
+                f"处理失败: {str(e)}\n{traceback.format_exc()}"))
 
     def _reset_params(self):
-        self._tone_var.set(0.8)
-        self._color_var.set(0.9)
-        self._skin_var.set(0.85)
-        self._skin_on_var.set(True)
-        self._strength_var.set(1.0)
-        self._exposure_var.set(0.0)
-        self._contrast_var.set(0.0)
-        self._highlights_var.set(0.0)
-        self._shadows_var.set(0.0)
-        self._whites_var.set(0.0)
-        self._blacks_var.set(0.0)
-        self._hi_hue_var.set(0.0)
-        self._hi_sat_var.set(0.0)
-        self._sh_hue_var.set(0.0)
-        self._sh_sat_var.set(0.0)
-        self._temp_var.set(0.0)
-        self._tint_var.set(0.0)
-        self._set_status("参数已重置")
+        """重置参数"""
+        self.tone_strength.set(0.8)
+        self.color_strength.set(0.9)
+        self.skin_protection.set(True)
+        self.skin_strength.set(0.80)
+        self.status_var.set("参数已重置")
 
 
-# ══════════════════════════════════════════════════════════
-#  入口
-# ══════════════════════════════════════════════════════════
+def main():
+    root = tk.Tk()
+    root.tk.call("tk", "scaling", 1.2)
+    app = ZsTrackerApp(root)
+    root.mainloop()
+
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    main()

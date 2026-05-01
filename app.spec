@@ -40,6 +40,7 @@ a = Analysis(
         'evaluator',
         'threading',
     ],
+    excludes=['pandas', 'openpyxl', 'pytz', 'dateutil', 'fsspec', 'sqlalchemy'],
     hookspath=[],
     hooksconfig={},
     keys=[],
